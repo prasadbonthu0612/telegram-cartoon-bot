@@ -5,6 +5,8 @@ import re
 import shutil
 import subprocess
 import tempfile
+import urllib.parse
+import urllib.request
 
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -32,6 +34,12 @@ API_HASH = os.getenv("API_HASH")
 TELEGRAM_SESSION = os.getenv("TELEGRAM_SESSION")
 
 PORT = int(os.getenv("PORT", "10000"))
+
+# Instagram / Meta
+INSTAGRAM_ACCESS_TOKEN = os.getenv("INSTAGRAM_ACCESS_TOKEN")
+INSTAGRAM_USER_ID = os.getenv("INSTAGRAM_USER_ID")
+INSTAGRAM_API_VERSION = os.getenv("INSTAGRAM_API_VERSION", "v25.0")
+INSTAGRAM_API_BASE = f"https://graph.instagram.com/{INSTAGRAM_API_VERSION}"
 
 STORAGE_CHANNEL_NAME = "Cartoon Clip Storage"
 
@@ -245,6 +253,110 @@ async def load_admin_chat_id():
             continue
 
     return None
+
+
+# ============================================================
+# INSTAGRAM API
+# ============================================================
+
+def instagram_api_get(path, params=None):
+    """
+    Make a GET request to the current Instagram API using the
+    Instagram Login access token stored in Render environment variables.
+    """
+    if not INSTAGRAM_ACCESS_TOKEN:
+        raise RuntimeError("INSTAGRAM_ACCESS_TOKEN is missing.")
+
+    if not INSTAGRAM_USER_ID:
+        raise RuntimeError("INSTAGRAM_USER_ID is missing.")
+
+    params = dict(params or {})
+    params["access_token"] = INSTAGRAM_ACCESS_TOKEN
+
+    url = f"{INSTAGRAM_API_BASE}/{path.lstrip('/')}"
+    url += "?" + urllib.parse.urlencode(params)
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Cartoon-Instagram-Bot/1.0"
+        },
+        method="GET",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            body = response.read().decode("utf-8")
+            return response.status, json.loads(body)
+
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+
+        try:
+            data = json.loads(body)
+        except Exception:
+            data = {"raw": body}
+
+        raise RuntimeError(
+            f"Instagram API HTTP {e.code}: {json.dumps(data, ensure_ascii=False)}"
+        )
+
+    except Exception as e:
+        raise RuntimeError(
+            f"Instagram API request failed: {type(e).__name__}: {str(e)}"
+        )
+
+
+async def test_instagram(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    """
+    Verify the Instagram access token and Instagram User ID.
+    The token itself is never sent to Telegram.
+    """
+    try:
+        if not INSTAGRAM_ACCESS_TOKEN:
+            await update.message.reply_text(
+                "❌ INSTAGRAM_ACCESS_TOKEN is missing in Render."
+            )
+            return
+
+        if not INSTAGRAM_USER_ID:
+            await update.message.reply_text(
+                "❌ INSTAGRAM_USER_ID is missing in Render."
+            )
+            return
+
+        await update.message.reply_text(
+            "🔎 Checking Instagram API connection..."
+        )
+
+        status_code, data = instagram_api_get(
+            INSTAGRAM_USER_ID,
+            {
+                "fields": "id,username"
+            }
+        )
+
+        instagram_id = data.get("id")
+        username = data.get("username")
+
+        await update.message.reply_text(
+            "✅ INSTAGRAM API CONNECTION WORKS!\n\n"
+            f"Username: @{username}\n"
+            f"Instagram User ID: {instagram_id}\n"
+            f"API version: {INSTAGRAM_API_VERSION}\n"
+            f"HTTP status: {status_code}\n\n"
+            "🔐 Access token was NOT displayed."
+        )
+
+    except Exception as e:
+        await update.message.reply_text(
+            "❌ INSTAGRAM API TEST FAILED\n\n"
+            f"Error: {type(e).__name__}\n"
+            f"{str(e)}"
+        )
 
 
 # ============================================================
@@ -1421,6 +1533,10 @@ def main():
             "TELEGRAM_SESSION is missing."
         )
 
+    # Instagram credentials are intentionally checked by
+    # /test_instagram so the existing Telegram pipeline can
+    # still start while Instagram setup is being verified.
+
     # --------------------------------------------------------
     # Health server
     # --------------------------------------------------------
@@ -1469,6 +1585,13 @@ def main():
         CommandHandler(
             "test_telegram",
             test_telegram
+        )
+    )
+
+    bot_application.add_handler(
+        CommandHandler(
+            "test_instagram",
+            test_instagram
         )
     )
 
