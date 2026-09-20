@@ -22,6 +22,8 @@ TELEGRAM_SESSION = os.getenv("TELEGRAM_SESSION")
 
 PORT = int(os.getenv("PORT", "10000"))
 
+STORAGE_CHANNEL_NAME = "Cartoon Clip Storage"
+
 telethon_client = None
 
 
@@ -86,93 +88,101 @@ async def test_telegram(
         )
 
 
-async def debug_telethon(
+async def debug_storage(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
     try:
-        # Get bot information through Bot API
-        bot_info = await context.bot.get_me()
+        await update.message.reply_text(
+            "🔎 Searching for Cartoon Clip Storage..."
+        )
 
-        bot_username = bot_info.username
-        bot_id = bot_info.id
+        storage_channel = None
 
-        if not bot_username:
-            raise RuntimeError(
-                "Bot username could not be determined."
+        # Get all dialogs available to the Telethon account
+        dialogs = await telethon_client.get_dialogs(
+            limit=None
+        )
+
+        print(
+            f"DEBUG: Telethon found {len(dialogs)} dialogs."
+        )
+
+        for dialog in dialogs:
+
+            entity = dialog.entity
+
+            title = getattr(
+                entity,
+                "title",
+                None
             )
 
-        print(
-            f"DEBUG: Bot username = @{bot_username}"
-        )
+            if title == STORAGE_CHANNEL_NAME:
+                storage_channel = entity
+                break
+
+        if storage_channel is None:
+            raise RuntimeError(
+                f'Could not find the channel '
+                f'"{STORAGE_CHANNEL_NAME}".'
+            )
+
+        channel_id = storage_channel.id
 
         print(
-            f"DEBUG: Bot ID = {bot_id}"
+            f"DEBUG: Storage channel found."
         )
-
-        # Get our Telethon account
-        me = await telethon_client.get_me()
-
         print(
-            f"DEBUG: Telethon account = "
-            f"{me.first_name} ({me.id})"
+            f"DEBUG: Channel ID = {channel_id}"
         )
 
-        # Find the bot through Telethon
-        bot_entity = await telethon_client.get_entity(
-            f"@{bot_username}"
-        )
-
-        print(
-            f"DEBUG: Telethon bot entity ID = "
-            f"{bot_entity.id}"
-        )
-
-        # Read recent messages from the bot conversation
+        # Read recent messages
         messages = await telethon_client.get_messages(
-            bot_entity,
+            storage_channel,
             limit=20
         )
 
         if not messages:
             await update.message.reply_text(
-                "⚠️ Telethon found the bot, "
-                "but there are no messages in the conversation."
+                "⚠️ Channel found, "
+                "but no messages were found."
             )
             return
 
         lines = [
-            "🔎 TELETHON DEBUG",
+            "📦 STORAGE CHANNEL DEBUG",
             "",
-            f"Bot: @{bot_username}",
-            f"Bot ID: {bot_id}",
+            f"Channel: {STORAGE_CHANNEL_NAME}",
+            f"Channel ID: {channel_id}",
             f"Messages found: {len(messages)}",
             "",
             "Recent messages:"
         ]
 
-        for msg in messages:
-
-            has_media = bool(msg.media)
+        for message in messages:
 
             media_type = "none"
 
-            if getattr(msg, "video", None):
+            if getattr(message, "video", None):
                 media_type = "VIDEO"
 
-            elif msg.media:
+            elif getattr(message, "document", None):
+                media_type = "DOCUMENT"
+
+            elif message.media:
                 media_type = type(
-                    msg.media
+                    message.media
                 ).__name__
 
             direction = (
                 "OUT"
-                if msg.out
+                if message.out
                 else "IN"
             )
 
             line = (
-                f"ID={msg.id} | "
+                f"ID={message.id} | "
                 f"{direction} | "
                 f"media={media_type}"
             )
@@ -180,13 +190,11 @@ async def debug_telethon(
             lines.append(line)
 
             print(
-                f"DEBUG MESSAGE: {line}"
+                f"DEBUG STORAGE MESSAGE: {line}"
             )
 
         result = "\n".join(lines)
 
-        # Telegram messages have a practical length limit,
-        # so keep the diagnostic response short.
         if len(result) > 3500:
             result = result[:3500]
 
@@ -197,12 +205,12 @@ async def debug_telethon(
     except Exception as e:
 
         print(
-            f"DEBUG ERROR: "
+            f"STORAGE DEBUG ERROR: "
             f"{type(e).__name__}: {str(e)}"
         )
 
         await update.message.reply_text(
-            "❌ Telethon debug failed.\n\n"
+            "❌ Storage diagnostic failed.\n\n"
             f"Error: {type(e).__name__}\n"
             f"Details: {str(e)}"
         )
@@ -217,8 +225,7 @@ async def handle_video(
 
     await update.message.reply_text(
         "📥 Video received!\n\n"
-        "This is currently diagnostic mode.\n"
-        "Use /debug_telethon to inspect the conversation."
+        "Video processing will be added next."
     )
 
 
@@ -267,7 +274,7 @@ def main():
         "Telethon connected successfully."
     )
 
-    # Start Bot API
+    # Start Telegram Bot API
     app = Application.builder().token(
         BOT_TOKEN
     ).build()
@@ -288,8 +295,8 @@ def main():
 
     app.add_handler(
         CommandHandler(
-            "debug_telethon",
-            debug_telethon
+            "debug_storage",
+            debug_storage
         )
     )
 
