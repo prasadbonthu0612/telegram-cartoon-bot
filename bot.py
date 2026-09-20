@@ -1,6 +1,7 @@
 import os
 import threading
 import tempfile
+import subprocess
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update
@@ -89,271 +90,341 @@ async def test_telegram(
         )
 
 
-async def debug_storage(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    try:
-        await update.message.reply_text(
-            "🔎 Searching for Cartoon Clip Storage..."
+async def find_storage_channel():
+    dialogs = await telethon_client.get_dialogs(
+        limit=None
+    )
+
+    for dialog in dialogs:
+
+        entity = dialog.entity
+
+        title = getattr(
+            entity,
+            "title",
+            None
         )
 
-        storage_channel = None
+        if title == STORAGE_CHANNEL_NAME:
+            return entity
 
-        dialogs = await telethon_client.get_dialogs(
-            limit=None
+    return None
+
+
+async def download_latest_storage_video():
+
+    storage_channel = await find_storage_channel()
+
+    if storage_channel is None:
+        raise RuntimeError(
+            f'Could not find "{STORAGE_CHANNEL_NAME}".'
         )
 
-        for dialog in dialogs:
+    messages = await telethon_client.get_messages(
+        storage_channel,
+        limit=20
+    )
 
-            entity = dialog.entity
-
-            title = getattr(
-                entity,
-                "title",
-                None
-            )
-
-            if title == STORAGE_CHANNEL_NAME:
-                storage_channel = entity
-                break
-
-        if storage_channel is None:
-            raise RuntimeError(
-                f'Could not find the channel '
-                f'"{STORAGE_CHANNEL_NAME}".'
-            )
-
-        channel_id = storage_channel.id
-
-        messages = await telethon_client.get_messages(
-            storage_channel,
-            limit=20
+    if not messages:
+        raise RuntimeError(
+            "No messages found in storage channel."
         )
 
-        if not messages:
-            await update.message.reply_text(
-                "⚠️ Channel found, "
-                "but no messages were found."
-            )
-            return
+    video_message = None
 
-        lines = [
-            "📦 STORAGE CHANNEL DEBUG",
-            "",
-            f"Channel: {STORAGE_CHANNEL_NAME}",
-            f"Channel ID: {channel_id}",
-            f"Messages found: {len(messages)}",
-            "",
-            "Recent messages:"
-        ]
+    for message in messages:
 
-        for message in messages:
+        if getattr(message, "video", None):
+            video_message = message
+            break
 
-            media_type = "none"
-
-            if getattr(message, "video", None):
-                media_type = "VIDEO"
-
-            elif getattr(message, "document", None):
-                media_type = "DOCUMENT"
-
-            elif message.media:
-                media_type = type(
-                    message.media
-                ).__name__
-
-            direction = (
-                "OUT"
-                if message.out
-                else "IN"
-            )
-
-            lines.append(
-                f"ID={message.id} | "
-                f"{direction} | "
-                f"media={media_type}"
-            )
-
-        result = "\n".join(lines)
-
-        if len(result) > 3500:
-            result = result[:3500]
-
-        await update.message.reply_text(
-            result
+    if video_message is None:
+        raise RuntimeError(
+            "No video found in storage channel."
         )
 
-    except Exception as e:
+    temp_dir = tempfile.gettempdir()
+
+    input_path = os.path.join(
+        temp_dir,
+        f"cartoon_input_{video_message.id}.mp4"
+    )
+
+    print(
+        f"Downloading storage video "
+        f"message {video_message.id}"
+    )
+
+    downloaded_file = await telethon_client.download_media(
+        video_message,
+        file=input_path
+    )
+
+    if not downloaded_file:
+        raise RuntimeError(
+            "Video download returned no file."
+        )
+
+    return downloaded_file
+
+
+def split_video(input_path):
+
+    output_dir = tempfile.mkdtemp(
+        prefix="cartoon_clips_"
+    )
+
+    output_pattern = os.path.join(
+        output_dir,
+        "clip_%03d.mp4"
+    )
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        input_path,
+
+        # Split every 40 seconds
+        "-map",
+        "0",
+
+        "-c",
+        "copy",
+
+        "-f",
+        "segment",
+
+        "-segment_time",
+        "40",
+
+        "-reset_timestamps",
+        "1",
+
+        output_pattern,
+    ]
+
+    print(
+        "Running FFmpeg:"
+    )
+
+    print(
+        " ".join(command)
+    )
+
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    if result.returncode != 0:
 
         print(
-            f"STORAGE DEBUG ERROR: "
-            f"{type(e).__name__}: {str(e)}"
+            "FFmpeg failed:"
         )
 
-        await update.message.reply_text(
-            "❌ Storage diagnostic failed.\n\n"
-            f"Error: {type(e).__name__}\n"
-            f"Details: {str(e)}"
+        print(
+            result.stderr
         )
 
+        raise RuntimeError(
+            "FFmpeg failed to split the video."
+        )
 
-async def download_storage_test(
+    clips = []
+
+    for filename in sorted(
+        os.listdir(output_dir)
+    ):
+
+        if filename.endswith(".mp4"):
+
+            clips.append(
+                os.path.join(
+                    output_dir,
+                    filename
+                )
+            )
+
+    if not clips:
+        raise RuntimeError(
+            "FFmpeg completed but created no clips."
+        )
+
+    return output_dir, clips
+
+
+async def split_storage_test(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+
+    input_path = None
+    output_dir = None
+
     try:
+
         await update.message.reply_text(
             "📦 Opening Cartoon Clip Storage..."
         )
 
-        storage_channel = None
-
-        # Find the private storage channel
-        dialogs = await telethon_client.get_dialogs(
-            limit=None
-        )
-
-        for dialog in dialogs:
-
-            entity = dialog.entity
-
-            title = getattr(
-                entity,
-                "title",
-                None
-            )
-
-            if title == STORAGE_CHANNEL_NAME:
-                storage_channel = entity
-                break
-
-        if storage_channel is None:
-            raise RuntimeError(
-                f'Could not find "{STORAGE_CHANNEL_NAME}".'
-            )
-
-        print(
-            f"Storage channel found: "
-            f"{storage_channel.id}"
-        )
-
         await update.message.reply_text(
-            "🔎 Finding the latest video..."
+            "🔎 Finding latest video..."
         )
 
-        # Get recent messages
-        messages = await telethon_client.get_messages(
-            storage_channel,
-            limit=20
-        )
+        input_path = await download_latest_storage_video()
 
-        video_message = None
-
-        # Find the newest video
-        for message in messages:
-
-            if getattr(message, "video", None):
-                video_message = message
-                break
-
-        if video_message is None:
-            raise RuntimeError(
-                "No video was found in the storage channel."
-            )
-
-        print(
-            f"Found video message: "
-            f"{video_message.id}"
-        )
-
-        await update.message.reply_text(
-            "✅ Video found!\n\n"
-            f"Message ID: {video_message.id}\n\n"
-            "⬇️ Downloading through Telethon..."
-        )
-
-        # Temporary location
-        temp_dir = tempfile.gettempdir()
-
-        download_path = os.path.join(
-            temp_dir,
-            f"storage_test_{video_message.id}.mp4"
-        )
-
-        print(
-            f"Download path: {download_path}"
-        )
-
-        # Download the video
-        downloaded_file = (
-            await telethon_client.download_media(
-                video_message,
-                file=download_path
-            )
-        )
-
-        if not downloaded_file:
-            raise RuntimeError(
-                "Telethon returned no downloaded file."
-            )
-
-        # Check file
         file_size = os.path.getsize(
-            downloaded_file
+            input_path
         )
 
         file_size_mb = (
             file_size / (1024 * 1024)
         )
 
-        print(
-            f"Download successful: "
-            f"{file_size_mb:.2f} MB"
-        )
-
         await update.message.reply_text(
-            "🎉 DOWNLOAD SUCCESSFUL!\n\n"
-            f"📦 File size: {file_size_mb:.2f} MB\n"
-            f"📁 File: {os.path.basename(downloaded_file)}\n\n"
-            "✅ Telethon can download videos "
-            "from your storage channel."
+            "✅ Video downloaded!\n\n"
+            f"📦 Size: {file_size_mb:.2f} MB\n\n"
+            "✂️ Starting FFmpeg...\n"
+            "Splitting into 40-second clips..."
         )
 
-        # Delete temporary test file
-        try:
-            os.remove(downloaded_file)
+        output_dir, clips = split_video(
+            input_path
+        )
 
-            print(
-                "Temporary test file deleted."
+        clip_lines = []
+
+        for index, clip in enumerate(
+            clips,
+            start=1
+        ):
+
+            clip_size = os.path.getsize(
+                clip
             )
 
-        except Exception as cleanup_error:
+            clip_size_mb = (
+                clip_size / (1024 * 1024)
+            )
 
+            clip_lines.append(
+                f"Clip {index}: "
+                f"{clip_size_mb:.2f} MB"
+            )
+
+        result_text = (
+            "🎉 FFMPEG TEST SUCCESSFUL!\n\n"
+            f"🎬 Original: "
+            f"{file_size_mb:.2f} MB\n"
+            f"✂️ Clips created: {len(clips)}\n\n"
+            + "\n".join(clip_lines)
+            + "\n\n"
+            "✅ 40-second splitting works."
+        )
+
+        # Keep Telegram message reasonably short
+        if len(result_text) > 3500:
+            result_text = (
+                "🎉 FFMPEG TEST SUCCESSFUL!\n\n"
+                f"🎬 Original: "
+                f"{file_size_mb:.2f} MB\n"
+                f"✂️ Clips created: {len(clips)}\n\n"
+                "The clips were successfully created."
+            )
+
+        await update.message.reply_text(
+            result_text
+        )
+
+        print(
+            f"FFmpeg created {len(clips)} clips."
+        )
+
+        for clip in clips:
             print(
-                f"Cleanup warning: "
-                f"{type(cleanup_error).__name__}: "
-                f"{str(cleanup_error)}"
+                f"Created: {clip}"
             )
 
     except Exception as e:
 
         print(
-            f"STORAGE DOWNLOAD ERROR: "
+            f"FFMPEG TEST ERROR: "
             f"{type(e).__name__}: {str(e)}"
         )
 
         await update.message.reply_text(
-            "❌ STORAGE DOWNLOAD FAILED\n\n"
+            "❌ FFMPEG TEST FAILED\n\n"
             f"Error: {type(e).__name__}\n"
             f"Details: {str(e)}"
         )
+
+    finally:
+
+        # Delete original downloaded video
+        if input_path:
+
+            try:
+                if os.path.exists(input_path):
+                    os.remove(input_path)
+
+                    print(
+                        "Original temporary video deleted."
+                    )
+
+            except Exception as cleanup_error:
+
+                print(
+                    f"Input cleanup warning: "
+                    f"{cleanup_error}"
+                )
+
+        # Delete generated clips
+        if output_dir:
+
+            try:
+
+                if os.path.exists(output_dir):
+
+                    for filename in os.listdir(
+                        output_dir
+                    ):
+
+                        file_path = os.path.join(
+                            output_dir,
+                            filename
+                        )
+
+                        if os.path.isfile(
+                            file_path
+                        ):
+                            os.remove(
+                                file_path
+                            )
+
+                    os.rmdir(
+                        output_dir
+                    )
+
+                    print(
+                        "Temporary clips deleted."
+                    )
+
+            except Exception as cleanup_error:
+
+                print(
+                    f"Clip cleanup warning: "
+                    f"{cleanup_error}"
+                )
 
 
 async def handle_video(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+
     if not update.message or not update.message.video:
         return
 
@@ -387,7 +458,7 @@ def main():
             "TELEGRAM_SESSION is missing."
         )
 
-    # Start Render health server
+    # Render health server
     health_thread = threading.Thread(
         target=start_health_server,
         daemon=True,
@@ -395,7 +466,7 @@ def main():
 
     health_thread.start()
 
-    # Start Telethon
+    # Telethon
     telethon_client = TelegramClient(
         StringSession(TELEGRAM_SESSION),
         API_ID,
@@ -408,7 +479,7 @@ def main():
         "Telethon connected successfully."
     )
 
-    # Start Telegram Bot API
+    # Telegram Bot API
     app = Application.builder().token(
         BOT_TOKEN
     ).build()
@@ -429,15 +500,8 @@ def main():
 
     app.add_handler(
         CommandHandler(
-            "debug_storage",
-            debug_storage
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "download_storage_test",
-            download_storage_test
+            "split_storage_test",
+            split_storage_test
         )
     )
 
