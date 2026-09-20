@@ -35,6 +35,7 @@ PORT = int(os.getenv("PORT", "10000"))
 
 STORAGE_CHANNEL_NAME = "Cartoon Clip Storage"
 
+
 # ============================================================
 # TELEGRAM STORAGE MARKERS
 # ============================================================
@@ -723,11 +724,11 @@ async def create_automatic_queue(
             "telegram_message_id":
                 message.id,
 
+            # FIX:
+            # Generate the filename ourselves instead
+            # of relying on Telegram's reported filename.
             "filename":
-                message.file.name
-                if message.file
-                and message.file.name
-                else f"Part {index}.mp4",
+                f"{safe_filename(title)} Part {index}.mp4",
 
             "status":
                 "PENDING",
