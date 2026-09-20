@@ -1,5 +1,6 @@
 import os
 import threading
+import tempfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update
@@ -99,13 +100,8 @@ async def debug_storage(
 
         storage_channel = None
 
-        # Get all dialogs available to the Telethon account
         dialogs = await telethon_client.get_dialogs(
             limit=None
-        )
-
-        print(
-            f"DEBUG: Telethon found {len(dialogs)} dialogs."
         )
 
         for dialog in dialogs:
@@ -130,14 +126,6 @@ async def debug_storage(
 
         channel_id = storage_channel.id
 
-        print(
-            f"DEBUG: Storage channel found."
-        )
-        print(
-            f"DEBUG: Channel ID = {channel_id}"
-        )
-
-        # Read recent messages
         messages = await telethon_client.get_messages(
             storage_channel,
             limit=20
@@ -181,16 +169,10 @@ async def debug_storage(
                 else "IN"
             )
 
-            line = (
+            lines.append(
                 f"ID={message.id} | "
                 f"{direction} | "
                 f"media={media_type}"
-            )
-
-            lines.append(line)
-
-            print(
-                f"DEBUG STORAGE MESSAGE: {line}"
             )
 
         result = "\n".join(lines)
@@ -211,6 +193,158 @@ async def debug_storage(
 
         await update.message.reply_text(
             "❌ Storage diagnostic failed.\n\n"
+            f"Error: {type(e).__name__}\n"
+            f"Details: {str(e)}"
+        )
+
+
+async def download_storage_test(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    try:
+        await update.message.reply_text(
+            "📦 Opening Cartoon Clip Storage..."
+        )
+
+        storage_channel = None
+
+        # Find the private storage channel
+        dialogs = await telethon_client.get_dialogs(
+            limit=None
+        )
+
+        for dialog in dialogs:
+
+            entity = dialog.entity
+
+            title = getattr(
+                entity,
+                "title",
+                None
+            )
+
+            if title == STORAGE_CHANNEL_NAME:
+                storage_channel = entity
+                break
+
+        if storage_channel is None:
+            raise RuntimeError(
+                f'Could not find "{STORAGE_CHANNEL_NAME}".'
+            )
+
+        print(
+            f"Storage channel found: "
+            f"{storage_channel.id}"
+        )
+
+        await update.message.reply_text(
+            "🔎 Finding the latest video..."
+        )
+
+        # Get recent messages
+        messages = await telethon_client.get_messages(
+            storage_channel,
+            limit=20
+        )
+
+        video_message = None
+
+        # Find the newest video
+        for message in messages:
+
+            if getattr(message, "video", None):
+                video_message = message
+                break
+
+        if video_message is None:
+            raise RuntimeError(
+                "No video was found in the storage channel."
+            )
+
+        print(
+            f"Found video message: "
+            f"{video_message.id}"
+        )
+
+        await update.message.reply_text(
+            "✅ Video found!\n\n"
+            f"Message ID: {video_message.id}\n\n"
+            "⬇️ Downloading through Telethon..."
+        )
+
+        # Temporary location
+        temp_dir = tempfile.gettempdir()
+
+        download_path = os.path.join(
+            temp_dir,
+            f"storage_test_{video_message.id}.mp4"
+        )
+
+        print(
+            f"Download path: {download_path}"
+        )
+
+        # Download the video
+        downloaded_file = (
+            await telethon_client.download_media(
+                video_message,
+                file=download_path
+            )
+        )
+
+        if not downloaded_file:
+            raise RuntimeError(
+                "Telethon returned no downloaded file."
+            )
+
+        # Check file
+        file_size = os.path.getsize(
+            downloaded_file
+        )
+
+        file_size_mb = (
+            file_size / (1024 * 1024)
+        )
+
+        print(
+            f"Download successful: "
+            f"{file_size_mb:.2f} MB"
+        )
+
+        await update.message.reply_text(
+            "🎉 DOWNLOAD SUCCESSFUL!\n\n"
+            f"📦 File size: {file_size_mb:.2f} MB\n"
+            f"📁 File: {os.path.basename(downloaded_file)}\n\n"
+            "✅ Telethon can download videos "
+            "from your storage channel."
+        )
+
+        # Delete temporary test file
+        try:
+            os.remove(downloaded_file)
+
+            print(
+                "Temporary test file deleted."
+            )
+
+        except Exception as cleanup_error:
+
+            print(
+                f"Cleanup warning: "
+                f"{type(cleanup_error).__name__}: "
+                f"{str(cleanup_error)}"
+            )
+
+    except Exception as e:
+
+        print(
+            f"STORAGE DOWNLOAD ERROR: "
+            f"{type(e).__name__}: {str(e)}"
+        )
+
+        await update.message.reply_text(
+            "❌ STORAGE DOWNLOAD FAILED\n\n"
             f"Error: {type(e).__name__}\n"
             f"Details: {str(e)}"
         )
@@ -297,6 +431,13 @@ def main():
         CommandHandler(
             "debug_storage",
             debug_storage
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "download_storage_test",
+            download_storage_test
         )
     )
 
