@@ -11,8 +11,15 @@ from telegram.ext import (
     filters,
 )
 
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH")
+TELEGRAM_SESSION = os.getenv("TELEGRAM_SESSION")
+
 PORT = int(os.getenv("PORT", "10000"))
 
 
@@ -40,7 +47,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Hello!\n\n"
         "I'm your Cartoon Instagram Bot.\n\n"
-        "Send me a video and I'll process it."
+        "Telegram connection is being initialized."
     )
 
 
@@ -53,13 +60,32 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable is missing.")
+        raise RuntimeError("BOT_TOKEN is missing.")
+
+    if not API_ID:
+        raise RuntimeError("API_ID is missing.")
+
+    if not API_HASH:
+        raise RuntimeError("API_HASH is missing.")
+
+    if not TELEGRAM_SESSION:
+        raise RuntimeError("TELEGRAM_SESSION is missing.")
 
     health_thread = threading.Thread(
         target=start_health_server,
         daemon=True,
     )
     health_thread.start()
+
+    telethon_client = TelegramClient(
+        StringSession(TELEGRAM_SESSION),
+        API_ID,
+        API_HASH,
+    )
+
+    telethon_client.start()
+
+    print("Telethon connected successfully.")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
