@@ -1,6 +1,5 @@
 import os
 import threading
-import tempfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update
@@ -27,6 +26,7 @@ telethon_client = None
 
 
 class HealthHandler(BaseHTTPRequestHandler):
+
     def do_GET(self):
         if self.path == "/health":
             self.send_response(200)
@@ -75,13 +75,136 @@ async def test_telegram(
 
         await update.message.reply_text(
             f"✅ Telethon connected!\n\n"
-            f"Account: {name}"
+            f"Account: {name}\n"
+            f"User ID: {me.id}"
         )
 
     except Exception as e:
         await update.message.reply_text(
             f"❌ Telethon connection failed:\n"
             f"{type(e).__name__}: {str(e)}"
+        )
+
+
+async def debug_telethon(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    try:
+        # Get bot information through Bot API
+        bot_info = await context.bot.get_me()
+
+        bot_username = bot_info.username
+        bot_id = bot_info.id
+
+        if not bot_username:
+            raise RuntimeError(
+                "Bot username could not be determined."
+            )
+
+        print(
+            f"DEBUG: Bot username = @{bot_username}"
+        )
+
+        print(
+            f"DEBUG: Bot ID = {bot_id}"
+        )
+
+        # Get our Telethon account
+        me = await telethon_client.get_me()
+
+        print(
+            f"DEBUG: Telethon account = "
+            f"{me.first_name} ({me.id})"
+        )
+
+        # Find the bot through Telethon
+        bot_entity = await telethon_client.get_entity(
+            f"@{bot_username}"
+        )
+
+        print(
+            f"DEBUG: Telethon bot entity ID = "
+            f"{bot_entity.id}"
+        )
+
+        # Read recent messages from the bot conversation
+        messages = await telethon_client.get_messages(
+            bot_entity,
+            limit=20
+        )
+
+        if not messages:
+            await update.message.reply_text(
+                "⚠️ Telethon found the bot, "
+                "but there are no messages in the conversation."
+            )
+            return
+
+        lines = [
+            "🔎 TELETHON DEBUG",
+            "",
+            f"Bot: @{bot_username}",
+            f"Bot ID: {bot_id}",
+            f"Messages found: {len(messages)}",
+            "",
+            "Recent messages:"
+        ]
+
+        for msg in messages:
+
+            has_media = bool(msg.media)
+
+            media_type = "none"
+
+            if getattr(msg, "video", None):
+                media_type = "VIDEO"
+
+            elif msg.media:
+                media_type = type(
+                    msg.media
+                ).__name__
+
+            direction = (
+                "OUT"
+                if msg.out
+                else "IN"
+            )
+
+            line = (
+                f"ID={msg.id} | "
+                f"{direction} | "
+                f"media={media_type}"
+            )
+
+            lines.append(line)
+
+            print(
+                f"DEBUG MESSAGE: {line}"
+            )
+
+        result = "\n".join(lines)
+
+        # Telegram messages have a practical length limit,
+        # so keep the diagnostic response short.
+        if len(result) > 3500:
+            result = result[:3500]
+
+        await update.message.reply_text(
+            result
+        )
+
+    except Exception as e:
+
+        print(
+            f"DEBUG ERROR: "
+            f"{type(e).__name__}: {str(e)}"
+        )
+
+        await update.message.reply_text(
+            "❌ Telethon debug failed.\n\n"
+            f"Error: {type(e).__name__}\n"
+            f"Details: {str(e)}"
         )
 
 
@@ -94,164 +217,13 @@ async def handle_video(
 
     await update.message.reply_text(
         "📥 Video received!\n\n"
-        "🔎 Finding the video through Telethon..."
+        "This is currently diagnostic mode.\n"
+        "Use /debug_telethon to inspect the conversation."
     )
-
-    try:
-        # Get the bot's username using the Bot API
-        bot_info = await context.bot.get_me()
-        bot_username = bot_info.username
-
-        if not bot_username:
-            raise RuntimeError(
-                "Could not determine bot username."
-            )
-
-        print(
-            f"Bot username: @{bot_username}"
-        )
-
-        # Find the bot conversation through Telethon
-        telethon_bot = await telethon_client.get_entity(
-            f"@{bot_username}"
-        )
-
-        print(
-            f"Telethon bot entity found: "
-            f"{telethon_bot.id}"
-        )
-
-        # Get recent messages from the bot conversation
-        recent_messages = await telethon_client.get_messages(
-            telethon_bot,
-            limit=20
-        )
-
-        if not recent_messages:
-            raise RuntimeError(
-                "Telethon found no messages in the bot conversation."
-            )
-
-        bot_message_id = update.message.message_id
-
-        print(
-            f"Bot API message ID: {bot_message_id}"
-        )
-
-        # First try to find the exact message ID
-        telethon_message = None
-
-        for message in recent_messages:
-            if message.id == bot_message_id:
-                telethon_message = message
-                break
-
-        # If IDs don't match, find the most recent incoming
-        # video message from the user.
-        if telethon_message is None:
-            print(
-                "Exact message ID was not found. "
-                "Searching recent messages for video..."
-            )
-
-            for message in recent_messages:
-                if (
-                    message.media
-                    and getattr(message, "video", None)
-                    and not message.out
-                ):
-                    telethon_message = message
-                    break
-
-        if telethon_message is None:
-            raise RuntimeError(
-                "Telethon could not find the video "
-                "in the bot conversation."
-            )
-
-        print(
-            f"Found Telethon message ID: "
-            f"{telethon_message.id}"
-        )
-
-        await update.message.reply_text(
-            "✅ Video found!\n\n"
-            "⬇️ Downloading through Telethon..."
-        )
-
-        # Temporary download location
-        temp_dir = tempfile.gettempdir()
-
-        download_path = os.path.join(
-            temp_dir,
-            f"cartoon_test_{telethon_message.id}.mp4"
-        )
-
-        print(
-            f"Downloading to: {download_path}"
-        )
-
-        # Download using Telethon
-        downloaded_file = await telethon_client.download_media(
-            telethon_message,
-            file=download_path
-        )
-
-        if not downloaded_file:
-            raise RuntimeError(
-                "Telethon returned no downloaded file."
-            )
-
-        # Get downloaded file size
-        file_size = os.path.getsize(
-            downloaded_file
-        )
-
-        file_size_mb = file_size / (
-            1024 * 1024
-        )
-
-        print(
-            f"Video downloaded successfully: "
-            f"{file_size_mb:.2f} MB"
-        )
-
-        await update.message.reply_text(
-            "✅ VIDEO DOWNLOAD SUCCESSFUL!\n\n"
-            f"📦 Size: {file_size_mb:.2f} MB\n"
-            "📁 Temporary file created successfully.\n\n"
-            "🎉 Telethon can now download videos."
-        )
-
-        # Delete temporary test file
-        try:
-            os.remove(downloaded_file)
-
-            print(
-                "Temporary test file deleted."
-            )
-
-        except Exception as cleanup_error:
-            print(
-                f"Cleanup warning: "
-                f"{cleanup_error}"
-            )
-
-    except Exception as e:
-
-        print(
-            f"Video download failed: "
-            f"{type(e).__name__}: {str(e)}"
-        )
-
-        await update.message.reply_text(
-            "❌ Video download failed.\n\n"
-            f"Error: {type(e).__name__}\n"
-            f"Details: {str(e)}"
-        )
 
 
 def main():
+
     global telethon_client
 
     if not BOT_TOKEN:
@@ -274,7 +246,7 @@ def main():
             "TELEGRAM_SESSION is missing."
         )
 
-    # Start health server for Render
+    # Start Render health server
     health_thread = threading.Thread(
         target=start_health_server,
         daemon=True,
@@ -295,7 +267,7 @@ def main():
         "Telethon connected successfully."
     )
 
-    # Start Telegram Bot API
+    # Start Bot API
     app = Application.builder().token(
         BOT_TOKEN
     ).build()
@@ -311,6 +283,13 @@ def main():
         CommandHandler(
             "test_telegram",
             test_telegram
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "debug_telethon",
+            debug_telethon
         )
     )
 
