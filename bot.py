@@ -1,8 +1,5 @@
 import os
 import threading
-import tempfile
-import subprocess
-import shutil
 import json
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -16,9 +13,13 @@ from telegram.ext import (
     filters,
 )
 
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
+
+# ============================================================
+# ENVIRONMENT VARIABLES
+# ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID", "0"))
@@ -30,19 +31,42 @@ PORT = int(os.getenv("PORT", "10000"))
 STORAGE_CHANNEL_NAME = "Cartoon Clip Storage"
 
 QUEUE_MARKER = "[QUEUE_MANIFEST]"
+CONFIG_MARKER = "[BOT_CONFIG]"
+TITLE_REQUEST_MARKER = "[TITLE_REQUEST]"
 
 telethon_client = None
 
+# User's Telegram chat ID.
+# It gets saved persistently inside the Telegram storage channel.
+admin_chat_id = None
+
+# Current video waiting for a title.
+pending_video_message_id = None
+
+
+# ============================================================
+# HEALTH SERVER
+# ============================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
+
         if self.path == "/health":
+
             self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
+            self.send_header(
+                "Content-Type",
+                "text/plain"
+            )
             self.end_headers()
-            self.wfile.write(b"Bot is healthy")
+
+            self.wfile.write(
+                b"Bot is healthy"
+            )
+
         else:
+
             self.send_response(404)
             self.end_headers()
 
@@ -60,46 +84,9 @@ def start_health_server():
     server.serve_forever()
 
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    await update.message.reply_text(
-        "👋 Hello!\n\n"
-        "I'm your Cartoon Instagram Bot.\n\n"
-        "Telegram connection is working."
-    )
-
-
-async def test_telegram(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    try:
-
-        me = await telethon_client.get_me()
-
-        name = " ".join(
-            part
-            for part in [me.first_name, me.last_name]
-            if part
-        )
-
-        await update.message.reply_text(
-            f"✅ Telethon connected!\n\n"
-            f"Account: {name}\n"
-            f"User ID: {me.id}"
-        )
-
-    except Exception as e:
-
-        await update.message.reply_text(
-            f"❌ Telethon connection failed:\n"
-            f"{type(e).__name__}: {str(e)}"
-        )
-
+# ============================================================
+# FIND STORAGE CHANNEL
+# ============================================================
 
 async def find_storage_channel():
 
@@ -123,153 +110,484 @@ async def find_storage_channel():
     return None
 
 
-async def get_generated_clips(
-    storage_channel
-):
+# ============================================================
+# SAVE / LOAD ADMIN CHAT ID
+# ============================================================
+
+async def save_admin_chat_id(chat_id):
+
+    global admin_chat_id
+
+    admin_chat_id = chat_id
+
+    storage_channel = (
+        await find_storage_channel()
+    )
+
+    if storage_channel is None:
+        raise RuntimeError(
+            f'Could not find "{STORAGE_CHANNEL_NAME}".'
+        )
 
     messages = await telethon_client.get_messages(
         storage_channel,
         limit=100
     )
 
-    clips = []
+    # Check whether configuration already exists.
+    for message in messages:
+
+        text = message.message or ""
+
+        if text.startswith(CONFIG_MARKER):
+
+            try:
+
+                config = json.loads(
+                    text.split("\n", 1)[1]
+                )
+
+                old_chat_id = config.get(
+                    "admin_chat_id"
+                )
+
+                if old_chat_id == chat_id:
+                    return
+
+                new_text = (
+                    f"{CONFIG_MARKER}\n"
+                    f"{json.dumps({'admin_chat_id': chat_id})}"
+                )
+
+                await telethon_client.edit_message(
+                    storage_channel,
+                    message.id,
+                    new_text
+                )
+
+                return
+
+            except Exception:
+                pass
+
+    # No configuration exists.
+    config_text = (
+        f"{CONFIG_MARKER}\n"
+        f"{json.dumps({'admin_chat_id': chat_id})}"
+    )
+
+    await telethon_client.send_message(
+        storage_channel,
+        config_text
+    )
+
+
+async def load_admin_chat_id():
+
+    global admin_chat_id
+
+    storage_channel = (
+        await find_storage_channel()
+    )
+
+    if storage_channel is None:
+        return None
+
+    messages = await telethon_client.get_messages(
+        storage_channel,
+        limit=100
+    )
 
     for message in messages:
 
-        caption = message.message or ""
+        text = message.message or ""
 
-        if not caption.startswith("[CLIP]"):
+        if not text.startswith(CONFIG_MARKER):
             continue
 
-        if not getattr(message, "video", None):
+        try:
+
+            config = json.loads(
+                text.split("\n", 1)[1]
+            )
+
+            admin_chat_id = config.get(
+                "admin_chat_id"
+            )
+
+            return admin_chat_id
+
+        except Exception:
             continue
 
-        clips.append(message)
-
-    # Oldest generated clip first
-    clips.sort(
-        key=lambda message: message.id
-    )
-
-    return clips
+    return None
 
 
-async def create_queue_manifest(
+# ============================================================
+# START COMMAND
+# ============================================================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    global admin_chat_id
+
+    try:
+
+        chat_id = update.effective_chat.id
+
+        await save_admin_chat_id(
+            chat_id
+        )
+
+        await update.message.reply_text(
+            "👋 Hello!\n\n"
+            "✅ Your Telegram account is connected.\n\n"
+            "🎬 Now upload the ORIGINAL video "
+            "to Cartoon Clip Storage.\n\n"
+            "I'll automatically detect it and "
+            "ask you for the title."
+        )
+
+    except Exception as e:
+
+        await update.message.reply_text(
+            "❌ Could not save your Telegram "
+            "configuration.\n\n"
+            f"{type(e).__name__}: {str(e)}"
+        )
+
+
+# ============================================================
+# TELETHON TEST
+# ============================================================
+
+async def test_telegram(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
     try:
 
+        me = await telethon_client.get_me()
+
+        name = " ".join(
+            part
+            for part in [
+                me.first_name,
+                me.last_name
+            ]
+            if part
+        )
+
         await update.message.reply_text(
-            "📋 Creating persistent queue..."
+            f"✅ Telethon connected!\n\n"
+            f"Account: {name}\n"
+            f"User ID: {me.id}"
         )
 
-        storage_channel = (
-            await find_storage_channel()
+    except Exception as e:
+
+        await update.message.reply_text(
+            f"❌ Telethon connection failed:\n"
+            f"{type(e).__name__}: {str(e)}"
         )
 
-        if storage_channel is None:
-            raise RuntimeError(
-                f'Could not find "{STORAGE_CHANNEL_NAME}".'
-            )
 
-        clips = await get_generated_clips(
-            storage_channel
+# ============================================================
+# TITLE REQUEST STORAGE
+# ============================================================
+
+async def save_title_request(
+    video_message_id
+):
+
+    storage_channel = (
+        await find_storage_channel()
+    )
+
+    if storage_channel is None:
+        raise RuntimeError(
+            f'Could not find "{STORAGE_CHANNEL_NAME}".'
         )
 
-        if not clips:
-            raise RuntimeError(
-                "No generated [CLIP] videos "
-                "were found in storage."
-            )
+    messages = await telethon_client.get_messages(
+        storage_channel,
+        limit=100
+    )
 
-        now = datetime.now(
-            timezone.utc
-        ).isoformat()
+    request_text = (
+        f"{TITLE_REQUEST_MARKER}\n"
+        f"{json.dumps({'video_message_id': video_message_id})}"
+    )
 
-        queue = {
-            "queue_id": f"queue_{now}",
-            "created_at": now,
-            "status": "PENDING",
-            "total_clips": len(clips),
-            "next_clip_index": 1,
-            "clips": []
-        }
+    # Update existing request if present.
+    for message in messages:
 
-        for index, message in enumerate(
-            clips,
-            start=1
+        text = message.message or ""
+
+        if text.startswith(
+            TITLE_REQUEST_MARKER
         ):
 
-            queue["clips"].append({
-                "index": index,
-                "telegram_message_id": message.id,
-                "status": "PENDING",
-                "instagram_status": "NOT_POSTED",
-                "posted_at": None
-            })
-
-        manifest_json = json.dumps(
-            queue,
-            indent=2
-        )
-
-        manifest_text = (
-            f"{QUEUE_MARKER}\n\n"
-            f"Cartoon Instagram Bot Queue\n\n"
-            f"{manifest_json}"
-        )
-
-        manifest_message = (
-            await telethon_client.send_message(
+            await telethon_client.edit_message(
                 storage_channel,
-                manifest_text
+                message.id,
+                request_text
             )
-        )
 
-        await update.message.reply_text(
-            "🎉 QUEUE CREATED SUCCESSFULLY!\n\n"
-            f"📋 Queue ID:\n"
-            f"{queue['queue_id']}\n\n"
-            f"🎬 Total clips: "
-            f"{queue['total_clips']}\n"
-            f"▶️ Next clip: "
-            f"{queue['next_clip_index']}\n"
-            f"📊 Status: "
-            f"{queue['status']}\n\n"
-            f"📨 Manifest message ID: "
-            f"{manifest_message.id}\n\n"
-            "✅ Queue state is now stored "
-            "persistently in Telegram."
+            return
+
+    # Otherwise create one.
+    await telethon_client.send_message(
+        storage_channel,
+        request_text
+    )
+
+
+async def load_title_request():
+
+    storage_channel = (
+        await find_storage_channel()
+    )
+
+    if storage_channel is None:
+        return None
+
+    messages = await telethon_client.get_messages(
+        storage_channel,
+        limit=100
+    )
+
+    for message in messages:
+
+        text = message.message or ""
+
+        if not text.startswith(
+            TITLE_REQUEST_MARKER
+        ):
+            continue
+
+        try:
+
+            data = json.loads(
+                text.split("\n", 1)[1]
+            )
+
+            return data.get(
+                "video_message_id"
+            )
+
+        except Exception:
+            continue
+
+    return None
+
+
+# ============================================================
+# TELEGRAM CHANNEL VIDEO DETECTOR
+# ============================================================
+
+async def channel_video_handler(event):
+
+    global pending_video_message_id
+
+    try:
+
+        message = event.message
+
+        # Only process videos.
+        if not message.video:
+            return
+
+        caption = message.message or ""
+
+        # Ignore generated clips.
+        if caption.startswith("[CLIP]"):
+            return
+
+        # Ignore queue manifests.
+        if caption.startswith(QUEUE_MARKER):
+            return
+
+        # Ignore bot configuration messages.
+        if caption.startswith(CONFIG_MARKER):
+            return
+
+        # Ignore our title-request state message.
+        if caption.startswith(TITLE_REQUEST_MARKER):
+            return
+
+        print(
+            f"🎬 New video detected in storage."
         )
 
         print(
-            "Queue manifest created."
+            f"Telegram message ID: {message.id}"
         )
 
-        print(
-            f"Manifest message ID: "
-            f"{manifest_message.id}"
+        # Load the user's Telegram chat ID.
+        chat_id = await load_admin_chat_id()
+
+        if not chat_id:
+
+            print(
+                "⚠️ No admin chat ID is saved."
+            )
+
+            print(
+                "Open the bot and send /start first."
+            )
+
+            return
+
+        # Save the pending video persistently.
+        await save_title_request(
+            message.id
         )
 
-        print(
-            manifest_json
+        pending_video_message_id = message.id
+
+        # Ask the user for the title.
+        await send_title_question(
+            chat_id,
+            message.id
         )
 
     except Exception as e:
 
         print(
-            f"QUEUE CREATION ERROR: "
+            "❌ CHANNEL VIDEO HANDLER ERROR:"
+        )
+
+        print(
             f"{type(e).__name__}: {str(e)}"
         )
 
-        await update.message.reply_text(
-            "❌ QUEUE CREATION FAILED\n\n"
-            f"Error: {type(e).__name__}\n"
-            f"Details: {str(e)}"
+
+async def send_title_question(
+    chat_id,
+    video_message_id
+):
+
+    try:
+
+        await bot_application.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "🎬 NEW VIDEO DETECTED!\n\n"
+                f"Telegram video ID: {video_message_id}\n\n"
+                "✏️ What is the title of this video?\n\n"
+                "Example:\n"
+                "Doraemon Episode 25"
+            )
         )
 
+    except Exception as e:
+
+        print(
+            "❌ Could not send title question:"
+        )
+
+        print(
+            f"{type(e).__name__}: {str(e)}"
+        )
+
+
+# ============================================================
+# TITLE RESPONSE
+# ============================================================
+
+async def handle_title(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    global pending_video_message_id
+
+    if not update.message:
+        return
+
+    title = (
+        update.message.text or ""
+    ).strip()
+
+    if not title:
+        return
+
+    # Don't treat commands as titles.
+    if title.startswith("/"):
+        return
+
+    chat_id = update.effective_chat.id
+
+    saved_chat_id = await load_admin_chat_id()
+
+    if saved_chat_id != chat_id:
+        return
+
+    video_message_id = (
+        await load_title_request()
+    )
+
+    if not video_message_id:
+
+        await update.message.reply_text(
+            "ℹ️ I don't have a video waiting "
+            "for a title."
+        )
+
+        return
+
+    pending_video_message_id = (
+        video_message_id
+    )
+
+    print(
+        "🎬 TITLE RECEIVED"
+    )
+
+    print(
+        f"Title: {title}"
+    )
+
+    print(
+        f"Video message ID: "
+        f"{video_message_id}"
+    )
+
+    await update.message.reply_text(
+        "✅ Title received!\n\n"
+        f"🎬 {title}\n\n"
+        "⏳ Video processing will be added "
+        "in the next step."
+    )
+
+    # For now, we only test the title flow.
+    # Splitting will be added next.
+
+
+# ============================================================
+# EXISTING QUEUE TEST
+# ============================================================
+
+async def create_queue_manifest(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    await update.message.reply_text(
+        "ℹ️ The old manual queue test is "
+        "still available, but we'll replace "
+        "it with automatic queue creation."
+    )
+
+
+# ============================================================
+# SHOW QUEUE
+# ============================================================
 
 async def show_queue(
     update: Update,
@@ -315,7 +633,6 @@ async def show_queue(
 
         text = manifest.message
 
-        # Keep Telegram response below practical limits
         if len(text) > 3500:
             text = text[:3500]
 
@@ -333,23 +650,44 @@ async def show_queue(
         )
 
 
+# ============================================================
+# BOT VIDEO HANDLER
+# ============================================================
+
 async def handle_video(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not update.message or not update.message.video:
+    if not update.message:
+        return
+
+    if not update.message.video:
         return
 
     await update.message.reply_text(
-        "📥 Video received!\n\n"
-        "Video processing will be added next."
+        "📥 Video received by the bot.\n\n"
+        "For automatic processing, upload "
+        "the ORIGINAL video directly into "
+        "Cartoon Clip Storage."
     )
 
+
+# ============================================================
+# GLOBAL BOT APPLICATION
+# ============================================================
+
+bot_application = None
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
 
     global telethon_client
+    global bot_application
 
     if not BOT_TOKEN:
         raise RuntimeError(
@@ -371,7 +709,10 @@ def main():
             "TELEGRAM_SESSION is missing."
         )
 
+    # --------------------------------------------------------
     # Render health server
+    # --------------------------------------------------------
+
     health_thread = threading.Thread(
         target=start_health_server,
         daemon=True,
@@ -379,7 +720,10 @@ def main():
 
     health_thread.start()
 
+    # --------------------------------------------------------
     # Telethon
+    # --------------------------------------------------------
+
     telethon_client = TelegramClient(
         StringSession(TELEGRAM_SESSION),
         API_ID,
@@ -392,52 +736,107 @@ def main():
         "Telethon connected successfully."
     )
 
+    # --------------------------------------------------------
     # Telegram Bot API
-    app = Application.builder().token(
-        BOT_TOKEN
-    ).build()
+    # --------------------------------------------------------
 
-    app.add_handler(
+    bot_application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    bot_application.add_handler(
         CommandHandler(
             "start",
             start
         )
     )
 
-    app.add_handler(
+    bot_application.add_handler(
         CommandHandler(
             "test_telegram",
             test_telegram
         )
     )
 
-    app.add_handler(
+    bot_application.add_handler(
         CommandHandler(
             "create_queue_test",
             create_queue_manifest
         )
     )
 
-    app.add_handler(
+    bot_application.add_handler(
         CommandHandler(
             "queue",
             show_queue
         )
     )
 
-    app.add_handler(
+    bot_application.add_handler(
         MessageHandler(
             filters.VIDEO,
             handle_video,
         )
     )
 
+    bot_application.add_handler(
+        MessageHandler(
+            filters.TEXT
+            & ~filters.COMMAND,
+            handle_title,
+        )
+    )
+
+    # --------------------------------------------------------
+    # Telethon channel watcher
+    # --------------------------------------------------------
+
+    @telethon_client.on(
+        events.NewMessage()
+    )
+    async def new_telegram_message(event):
+
+        try:
+
+            chat = await event.get_chat()
+
+            title = getattr(
+                chat,
+                "title",
+                None
+            )
+
+            if title != STORAGE_CHANNEL_NAME:
+                return
+
+            await channel_video_handler(
+                event
+            )
+
+        except Exception as e:
+
+            print(
+                "❌ Telegram event error:"
+            )
+
+            print(
+                f"{type(e).__name__}: {str(e)}"
+            )
+
+    # --------------------------------------------------------
+    # Start bot
+    # --------------------------------------------------------
+
     print(
         f"Bot is running. "
         f"Health server listening on port {PORT}."
     )
 
-    app.run_polling()
+    bot_application.run_polling(
+        close_loop=False
+    )
 
 
 if __name__ == "__main__":
