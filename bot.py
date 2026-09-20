@@ -22,6 +22,8 @@ TELEGRAM_SESSION = os.getenv("TELEGRAM_SESSION")
 
 PORT = int(os.getenv("PORT", "10000"))
 
+telethon_client = None
+
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -51,7 +53,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def test_telegram(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    try:
+        me = await telethon_client.get_me()
+
+        name = " ".join(
+            part for part in [me.first_name, me.last_name]
+            if part
+        )
+
+        await update.message.reply_text(
+            f"✅ Telethon connected!\n\n"
+            f"Account: {name}"
+        )
+
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Telethon connection failed:\n"
+            f"{type(e).__name__}: {str(e)}"
+        )
+
+
+async def handle_video(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
     await update.message.reply_text(
         "📥 Video received!\n\n"
         "Video processing will be added next."
@@ -59,6 +88,8 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    global telethon_client
+
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is missing.")
 
@@ -71,12 +102,14 @@ def main():
     if not TELEGRAM_SESSION:
         raise RuntimeError("TELEGRAM_SESSION is missing.")
 
+    # Start health server for Render
     health_thread = threading.Thread(
         target=start_health_server,
         daemon=True,
     )
     health_thread.start()
 
+    # Start Telethon
     telethon_client = TelegramClient(
         StringSession(TELEGRAM_SESSION),
         API_ID,
@@ -87,9 +120,16 @@ def main():
 
     print("Telethon connected successfully.")
 
+    # Start Telegram Bot API
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(
+        CommandHandler("start", start)
+    )
+
+    app.add_handler(
+        CommandHandler("test_telegram", test_telegram)
+    )
 
     app.add_handler(
         MessageHandler(
@@ -98,7 +138,10 @@ def main():
         )
     )
 
-    print(f"Bot is running. Health server listening on port {PORT}.")
+    print(
+        f"Bot is running. "
+        f"Health server listening on port {PORT}."
+    )
 
     app.run_polling()
 
