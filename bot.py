@@ -1,5 +1,6 @@
 import os
 import threading
+import tempfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update
@@ -45,11 +46,14 @@ def start_health_server():
     server.serve_forever()
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
     await update.message.reply_text(
         "👋 Hello!\n\n"
         "I'm your Cartoon Instagram Bot.\n\n"
-        "Telegram connection is being initialized."
+        "Telegram connection is working."
     )
 
 
@@ -81,10 +85,111 @@ async def handle_video(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+    if not update.message or not update.message.video:
+        return
+
     await update.message.reply_text(
         "📥 Video received!\n\n"
-        "Video processing will be added next."
+        "⬇️ Downloading through Telethon..."
     )
+
+    try:
+        # The message ID assigned by Telegram to the video
+        message_id = update.message.message_id
+
+        # The chat where the video was received
+        chat_id = update.effective_chat.id
+
+        print(
+            f"Video received. "
+            f"Chat ID: {chat_id}, "
+            f"Message ID: {message_id}"
+        )
+
+        # Get the same Telegram chat through Telethon
+        entity = await telethon_client.get_entity(chat_id)
+
+        # Get the exact message containing the video
+        telethon_message = await telethon_client.get_messages(
+            entity,
+            ids=message_id
+        )
+
+        if not telethon_message:
+            raise RuntimeError(
+                "Telethon could not find the video message."
+            )
+
+        if not telethon_message.media:
+            raise RuntimeError(
+                "The Telegram message does not contain media."
+            )
+
+        # Create a temporary download path
+        temp_dir = tempfile.gettempdir()
+
+        download_path = os.path.join(
+            temp_dir,
+            f"cartoon_test_{message_id}.mp4"
+        )
+
+        print(
+            f"Downloading video to: {download_path}"
+        )
+
+        # Download the video using Telethon
+        downloaded_file = await telethon_client.download_media(
+            telethon_message,
+            file=download_path
+        )
+
+        if not downloaded_file:
+            raise RuntimeError(
+                "Telethon returned no downloaded file."
+            )
+
+        # Check downloaded file size
+        file_size = os.path.getsize(downloaded_file)
+        file_size_mb = file_size / (1024 * 1024)
+
+        print(
+            f"Video downloaded successfully. "
+            f"Size: {file_size_mb:.2f} MB"
+        )
+
+        await update.message.reply_text(
+            "✅ Video downloaded successfully!\n\n"
+            f"📦 Size: {file_size_mb:.2f} MB\n"
+            f"📁 Temporary file created successfully.\n\n"
+            "The download test passed."
+        )
+
+        # Delete the temporary test file
+        try:
+            os.remove(downloaded_file)
+
+            print(
+                f"Temporary file deleted: "
+                f"{downloaded_file}"
+            )
+
+        except Exception as cleanup_error:
+            print(
+                f"Could not delete temporary file: "
+                f"{cleanup_error}"
+            )
+
+    except Exception as e:
+        print(
+            f"Video download failed: "
+            f"{type(e).__name__}: {str(e)}"
+        )
+
+        await update.message.reply_text(
+            "❌ Video download failed.\n\n"
+            f"Error: {type(e).__name__}\n"
+            f"Details: {str(e)}"
+        )
 
 
 def main():
@@ -107,6 +212,7 @@ def main():
         target=start_health_server,
         daemon=True,
     )
+
     health_thread.start()
 
     # Start Telethon
