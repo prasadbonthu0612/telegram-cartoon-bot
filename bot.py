@@ -589,7 +589,9 @@ def publish_reel_from_file(file_path, title, part_index, total_parts):
                 "media_type": "REELS",
                 "video_url": public_url,
                 "caption": caption,
-                "share_to_feed": "true",
+                # Keep this as a Reel only; do not also place it in
+                # the main Instagram Feed/grid.
+                "share_to_feed": "false",
             }
         )
 
@@ -1121,18 +1123,123 @@ def build_instagram_caption(title, part_index, total_parts):
 
 
 # ============================================================
-# SPLIT VIDEO
+# PROGRESS / VIDEO SPLITTING
 # ============================================================
 
-def split_video(
+class TelegramProgress:
+    """Edit one Telegram message instead of sending many progress messages."""
+
+    def __init__(self, chat_id, title, prefix=""):
+        self.chat_id = chat_id
+        self.title = title
+        self.prefix = prefix
+        self.message = None
+        self.last_update = 0.0
+        self.min_update_interval = 2.0
+
+    async def start(self, text):
+        self.message = await bot_application.bot.send_message(
+            chat_id=self.chat_id,
+            text=text,
+        )
+        self.last_update = time.monotonic()
+        return self.message
+
+    async def update(self, text, force=False):
+        if not self.message:
+            return
+
+        now = time.monotonic()
+        if not force and now - self.last_update < self.min_update_interval:
+            return
+
+        try:
+            await self.message.edit_text(text)
+            self.last_update = now
+        except Exception as e:
+            print(
+                "⚠️ Could not update Telegram progress message: "
+                f"{type(e).__name__}: {str(e)}"
+            )
+
+    async def finish(self, text):
+        await self.update(text, force=True)
+
+
+def make_progress_bar(percent, width=20):
+    percent = max(0.0, min(100.0, float(percent)))
+    filled = int(round(width * percent / 100.0))
+    filled = max(0, min(width, filled))
+    return "█" * filled + "░" * (width - filled)
+
+
+def format_duration(seconds):
+    if seconds is None or seconds < 0:
+        return "--:--"
+
+    seconds = int(seconds)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    if hours:
+        return f"{hours}h {minutes:02d}m {seconds:02d}s"
+    return f"{minutes:02d}m {seconds:02d}s"
+
+
+def get_video_duration(input_path):
+    """Return the input video's duration in seconds using ffprobe."""
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        input_path,
+    ]
+
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Could not determine video duration with ffprobe.\n"
+            f"{result.stderr.strip()}"
+        )
+
+    try:
+        duration = float(result.stdout.strip())
+    except ValueError:
+        raise RuntimeError(
+            f"ffprobe returned an invalid duration: {result.stdout!r}"
+        )
+
+    if duration <= 0:
+        raise RuntimeError("Video duration is zero or invalid.")
+
+    return duration
+
+
+async def split_video(
     input_path,
-    output_directory
+    output_directory,
+    progress=None,
 ):
+    """Split the video with FFmpeg and stream real progress to Telegram."""
 
     os.makedirs(
         output_directory,
         exist_ok=True
     )
+
+    duration = get_video_duration(input_path)
+    estimated_parts = max(1, int((duration + 39.999) // 40))
+    started = time.monotonic()
 
     output_pattern = os.path.join(
         output_directory,
@@ -1142,7 +1249,12 @@ def split_video(
     command = [
         "ffmpeg",
         "-y",
-
+        "-loglevel",
+        "error",
+        "-stats_period",
+        "1",
+        "-progress",
+        "pipe:1",
         "-i",
         input_path,
 
@@ -1154,84 +1266,103 @@ def split_video(
         "-map",
         "0:a:0?",
 
-        # Re-encode so segments can be
-        # cleanly cut around ~40 seconds.
+        # Re-encode so segments can be cleanly cut around ~40 seconds.
         "-c:v",
         "libx264",
-
         "-preset",
         "veryfast",
-
         "-crf",
         "23",
-
         "-c:a",
         "aac",
-
         "-b:a",
         "128k",
-
         "-movflags",
         "+faststart",
-
         "-f",
         "segment",
-
         "-segment_time",
         "40",
-
         "-reset_timestamps",
         "1",
-
         "-segment_format",
         "mp4",
-
-        output_pattern
+        output_pattern,
     ]
 
-    print(
-        "Running FFmpeg:"
+    print("Running FFmpeg:")
+    print(" ".join(command))
+    print(f"Video duration: {duration:.2f}s")
+    print(f"Estimated clips: {estimated_parts}")
+
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
 
-    print(
-        " ".join(command)
-    )
+    stderr_task = asyncio.create_task(process.stderr.read())
+    current_seconds = 0.0
+    last_percent = -1
 
-    result = subprocess.run(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
+    while True:
+        line = await process.stdout.readline()
+        if not line:
+            break
 
-    if result.returncode != 0:
+        line = line.decode("utf-8", errors="replace").strip()
+        if not line or "=" not in line:
+            continue
 
-        print(
-            "FFmpeg ERROR:"
-        )
+        key, value = line.split("=", 1)
 
-        print(
-            result.stderr
-        )
+        if key == "out_time_ms":
+            try:
+                current_seconds = int(value) / 1_000_000.0
+            except ValueError:
+                continue
 
+            percent = min(100.0, (current_seconds / duration) * 100.0)
+            elapsed = time.monotonic() - started
+
+            if percent > 0.1 and elapsed > 0:
+                estimated_total = elapsed / (percent / 100.0)
+                remaining = max(0.0, estimated_total - elapsed)
+            else:
+                remaining = None
+
+            rounded_percent = int(percent)
+
+            if progress and rounded_percent != last_percent:
+                last_percent = rounded_percent
+                await progress.update(
+                    "✂️ SPLITTING VIDEO\n\n"
+                    f"🎬 {progress.title}\n\n"
+                    f"{make_progress_bar(percent)} {percent:5.1f}%\n\n"
+                    f"⏱️ Elapsed: {format_duration(elapsed)}\n"
+                    f"⏳ Remaining: {format_duration(remaining)}\n\n"
+                    f"📹 Processed: {format_duration(current_seconds)} / "
+                    f"{format_duration(duration)}\n"
+                    f"✂️ Estimated parts: {estimated_parts}",
+                )
+
+    return_code = await process.wait()
+    stderr_text = (await stderr_task).decode("utf-8", errors="replace").strip()
+
+    if return_code != 0:
+        print("FFmpeg ERROR:")
+        print(stderr_text)
         raise RuntimeError(
-            "FFmpeg failed to split the video."
+            "FFmpeg failed to split the video.\n"
+            f"{stderr_text[-2000:]}"
         )
 
     clips = []
 
-    for filename in os.listdir(
-        output_directory
-    ):
-
-        if not filename.endswith(
-            ".mp4"
-        ):
+    for filename in os.listdir(output_directory):
+        if not filename.endswith(".mp4"):
             continue
-
-        if not filename.startswith(
-            "part_"
-        ):
+        if not filename.startswith("part_"):
             continue
 
         clips.append(
@@ -1244,9 +1375,17 @@ def split_video(
     clips.sort()
 
     if not clips:
-
         raise RuntimeError(
             "FFmpeg completed but produced no clips."
+        )
+
+    if progress:
+        await progress.finish(
+            "✂️ SPLITTING COMPLETE\n\n"
+            f"🎬 {progress.title}\n\n"
+            f"{make_progress_bar(100)} 100%\n\n"
+            f"📦 Clips created: {len(clips)}\n"
+            f"⏱️ Split time: {format_duration(time.monotonic() - started)}"
         )
 
     return clips
@@ -1255,6 +1394,8 @@ def split_video(
 # ============================================================
 # CREATE QUEUE MANIFEST
 # ============================================================
+
+
 
 async def create_automatic_queue(
     storage_channel,
@@ -1913,7 +2054,6 @@ async def process_original_video(
     )
 
     if storage_channel is None:
-
         raise RuntimeError(
             f'Could not find "{STORAGE_CHANNEL_NAME}".'
         )
@@ -1928,7 +2068,6 @@ async def process_original_video(
     )
 
     try:
-
         # ----------------------------------------------------
         # Find original
         # ----------------------------------------------------
@@ -1946,19 +2085,17 @@ async def process_original_video(
         )
 
         if not original_message:
-
             raise RuntimeError(
                 "Original video message could not be found."
             )
 
         if not original_message.video:
-
             raise RuntimeError(
                 "The stored message is not a video."
             )
 
         # ----------------------------------------------------
-        # Download original
+        # Download original with live progress
         # ----------------------------------------------------
 
         original_path = os.path.join(
@@ -1966,23 +2103,64 @@ async def process_original_video(
             "original.mp4"
         )
 
-        await bot_application.bot.send_message(
-            chat_id=admin_chat_id,
-            text=(
-                "⏳ PROCESSING STARTED\n\n"
-                f"🎬 {title}\n\n"
-                "📥 Downloading original video..."
-            )
+        download_progress = TelegramProgress(
+            admin_chat_id,
+            title,
         )
 
-        print(
-            "Downloading original..."
+        await download_progress.start(
+            "⏳ PROCESSING STARTED\n\n"
+            f"🎬 {title}\n\n"
+            "📥 DOWNLOADING ORIGINAL\n\n"
+            "Starting..."
         )
+
+        download_started = time.monotonic()
+        download_last_update = [0.0]
+
+        async def update_download_progress(current, total):
+            if not total:
+                return
+
+            percent = (current / total) * 100.0
+            elapsed = time.monotonic() - download_started
+
+            if percent > 0.1 and elapsed > 0:
+                speed = current / elapsed
+                remaining = (total - current) / speed if speed > 0 else None
+            else:
+                speed = 0
+                remaining = None
+
+            await download_progress.update(
+                "📥 DOWNLOADING ORIGINAL\n\n"
+                f"🎬 {title}\n\n"
+                f"{make_progress_bar(percent)} {percent:5.1f}%\n\n"
+                f"⏱️ Elapsed: {format_duration(elapsed)}\n"
+                f"⏳ Remaining: {format_duration(remaining)}\n"
+                f"📦 Downloaded: {current / 1024 / 1024:.1f} / "
+                f"{total / 1024 / 1024:.1f} MB\n"
+                f"🚀 Speed: {speed / 1024 / 1024:.2f} MB/s"
+            )
+
+        def download_callback(current, total):
+            now = time.monotonic()
+            if total and (
+                now - download_last_update[0] >= 2.0
+                or current >= total
+            ):
+                download_last_update[0] = now
+                asyncio.create_task(
+                    update_download_progress(current, total)
+                )
+
+        print("Downloading original...")
 
         downloaded_path = (
             await telethon_client.download_media(
                 original_message,
-                file=original_path
+                file=original_path,
+                progress_callback=download_callback,
             )
         )
 
@@ -1991,8 +2169,15 @@ async def process_original_video(
                 "Failed to download original video."
             )
 
+        await download_progress.finish(
+            "📥 DOWNLOAD COMPLETE\n\n"
+            f"🎬 {title}\n\n"
+            f"📦 Size: {os.path.getsize(original_path) / 1024 / 1024:.1f} MB\n"
+            f"⏱️ Time: {format_duration(time.monotonic() - download_started)}"
+        )
+
         # ----------------------------------------------------
-        # Split
+        # Split with live FFmpeg progress
         # ----------------------------------------------------
 
         clips_directory = os.path.join(
@@ -2000,47 +2185,52 @@ async def process_original_video(
             "clips"
         )
 
-        await bot_application.bot.send_message(
-            chat_id=admin_chat_id,
-            text=(
-                "✂️ Splitting video into "
-                "approximately 40-second parts..."
-            )
+        split_progress = TelegramProgress(
+            admin_chat_id,
+            title,
         )
 
-        clip_paths = split_video(
+        await split_progress.start(
+            "✂️ SPLITTING VIDEO\n\n"
+            f"🎬 {title}\n\n"
+            "Starting FFmpeg..."
+        )
+
+        clip_paths = await split_video(
             original_path,
-            clips_directory
+            clips_directory,
+            progress=split_progress,
         )
 
         print(
             f"FFmpeg created {len(clip_paths)} clips."
         )
 
-        await bot_application.bot.send_message(
-            chat_id=admin_chat_id,
-            text=(
-                f"✂️ Split complete!\n\n"
-                f"🎬 Total parts: {len(clip_paths)}\n\n"
-                "📤 Uploading clips to Telegram..."
-            )
-        )
-
         # ----------------------------------------------------
-        # Upload clips
+        # Upload clips to Telegram with live progress
         # ----------------------------------------------------
 
-        safe_title = safe_filename(
-            title
+        upload_progress = TelegramProgress(
+            admin_chat_id,
+            title,
         )
 
+        await upload_progress.start(
+            "📤 UPLOADING CLIPS TO TELEGRAM\n\n"
+            f"🎬 {title}\n\n"
+            f"📦 Preparing {len(clip_paths)} clips..."
+        )
+
+        safe_title = safe_filename(title)
         uploaded_messages = []
+        total_clips = len(clip_paths)
+        upload_started = time.monotonic()
+        upload_last_update = [0.0]
 
         for index, clip_path in enumerate(
             clip_paths,
             start=1
         ):
-
             filename = (
                 f"{safe_title} "
                 f"Part {index}.mp4"
@@ -2051,7 +2241,6 @@ async def process_original_video(
                 filename
             )
 
-            # Rename temporary FFmpeg output.
             os.rename(
                 clip_path,
                 final_path
@@ -2060,12 +2249,50 @@ async def process_original_video(
             caption = (
                 f"{CLIP_MARKER}\n"
                 f"Title: {title}\n"
-                f"Part: {index}/{len(clip_paths)}"
+                f"Part: {index}/{total_clips}"
             )
 
-            print(
-                f"Uploading {filename}..."
-            )
+            print(f"Uploading {filename}...")
+
+            clip_upload_started = time.monotonic()
+
+            async def update_clip_upload_progress(current, total, clip_no=index):
+                if not total:
+                    return
+
+                percent = (current / total) * 100.0
+                elapsed = time.monotonic() - clip_upload_started
+                speed = current / elapsed if elapsed > 0 else 0
+                remaining = (total - current) / speed if speed > 0 else None
+
+                overall_percent = (
+                    ((clip_no - 1) + (percent / 100.0))
+                    / total_clips
+                    * 100.0
+                )
+
+                await upload_progress.update(
+                    "📤 UPLOADING CLIPS TO TELEGRAM\n\n"
+                    f"🎬 {title}\n\n"
+                    f"Overall: {make_progress_bar(overall_percent)} "
+                    f"{overall_percent:5.1f}%\n\n"
+                    f"📦 Clip: {clip_no}/{total_clips}\n"
+                    f"{make_progress_bar(percent)} {percent:5.1f}%\n\n"
+                    f"⏱️ Elapsed: {format_duration(elapsed)}\n"
+                    f"⏳ Clip remaining: {format_duration(remaining)}\n"
+                    f"🚀 Speed: {speed / 1024 / 1024:.2f} MB/s"
+                )
+
+            def upload_callback(current, total, clip_no=index):
+                now = time.monotonic()
+                if total and (
+                    now - upload_last_update[0] >= 2.0
+                    or current >= total
+                ):
+                    upload_last_update[0] = now
+                    asyncio.create_task(
+                        update_clip_upload_progress(current, total, clip_no)
+                    )
 
             uploaded_message = (
                 await telethon_client.send_file(
@@ -2073,45 +2300,47 @@ async def process_original_video(
                     final_path,
                     caption=caption,
                     force_document=False,
-                    supports_streaming=True
+                    supports_streaming=True,
+                    progress_callback=upload_callback,
                 )
             )
 
-            # send_file can return a single Message
-            # or a list depending on the input.
             if isinstance(
                 uploaded_message,
                 list
             ):
-
                 if not uploaded_message:
                     raise RuntimeError(
                         f"Upload returned no message "
                         f"for Part {index}."
                     )
-
-                uploaded_message = (
-                    uploaded_message[0]
-                )
+                uploaded_message = uploaded_message[0]
 
             uploaded_messages.append(
                 uploaded_message
             )
 
+            overall_done = index / total_clips * 100.0
+            await upload_progress.update(
+                "📤 UPLOADING CLIPS TO TELEGRAM\n\n"
+                f"🎬 {title}\n\n"
+                f"{make_progress_bar(overall_done)} {overall_done:5.1f}%\n\n"
+                f"📦 Uploaded: {index}/{total_clips}\n"
+                f"⏱️ Total upload time: "
+                f"{format_duration(time.monotonic() - upload_started)}",
+                force=True,
+            )
+
             print(
                 f"Uploaded Part {index}: "
-                f"Telegram message ID "
-                f"{uploaded_message.id}"
+                f"Telegram message ID {uploaded_message.id}"
             )
 
         # ----------------------------------------------------
-        # SAFETY CHECK
+        # Safety check
         # ----------------------------------------------------
 
-        if len(uploaded_messages) != len(
-            clip_paths
-        ):
-
+        if len(uploaded_messages) != len(clip_paths):
             raise RuntimeError(
                 "Not all clips were uploaded. "
                 "Original will NOT be deleted."
@@ -2131,99 +2360,73 @@ async def process_original_video(
         )
 
         print(
-            f"Queue created: "
-            f"{queue['queue_id']}"
+            f"Queue created: {queue['queue_id']}"
         )
 
         print(
-            f"Manifest message ID: "
-            f"{manifest_message.id}"
+            f"Manifest message ID: {manifest_message.id}"
         )
 
         # ----------------------------------------------------
-        # ONLY NOW delete original
+        # Only now delete original
         # ----------------------------------------------------
 
-        print(
-            "All clips successfully uploaded."
-        )
-
-        print(
-            "Deleting original video..."
-        )
+        print("All clips successfully uploaded.")
+        print("Deleting original video...")
 
         await telethon_client.delete_messages(
             storage_channel,
             video_message_id
         )
 
-        print(
-            "Original video deleted."
-        )
-
-        # ----------------------------------------------------
-        # Cleanup state
-        # ----------------------------------------------------
+        print("Original video deleted.")
 
         await delete_title_request()
         await delete_processing_state()
-
-        # ----------------------------------------------------
-        # Notify user
-        # ----------------------------------------------------
 
         await bot_application.bot.send_message(
             chat_id=admin_chat_id,
             text=(
                 "✅ VIDEO PROCESSING COMPLETE!\n\n"
                 f"🎬 {title}\n\n"
-                f"✂️ Parts created: "
-                f"{len(uploaded_messages)}\n"
+                f"✂️ Parts created: {len(uploaded_messages)}\n"
                 "📤 All parts uploaded to Telegram\n"
                 "🗑️ Original video deleted\n\n"
                 "📋 Instagram queue created.\n\n"
-                "⏳ Waiting for the Instagram "
-                "automation to publish the clips."
+                "⏳ Waiting for the Instagram automation to "
+                "publish the clips."
             )
         )
 
     except Exception as e:
+        print("❌ VIDEO PROCESSING FAILED")
+        print(f"{type(e).__name__}: {str(e)}")
 
-        print(
-            "❌ VIDEO PROCESSING FAILED"
-        )
-
-        print(
-            f"{type(e).__name__}: {str(e)}"
-        )
-
-        # IMPORTANT:
-        # We deliberately DO NOT delete the original.
-        # It remains available for recovery.
-
-        await bot_application.bot.send_message(
-            chat_id=admin_chat_id,
-            text=(
-                "❌ VIDEO PROCESSING FAILED\n\n"
-                f"🎬 {title}\n\n"
-                f"Error: {type(e).__name__}\n"
-                f"{str(e)}\n\n"
-                "⚠️ The original video was NOT deleted.\n"
-                "Your video is still safe in "
-                "Cartoon Clip Storage."
+        # IMPORTANT: The original is deliberately NOT deleted on failure.
+        try:
+            await bot_application.bot.send_message(
+                chat_id=admin_chat_id,
+                text=(
+                    "❌ VIDEO PROCESSING FAILED\n\n"
+                    f"🎬 {title}\n\n"
+                    f"Error: {type(e).__name__}\n"
+                    f"{str(e)}\n\n"
+                    "⚠️ The original video was NOT deleted.\n"
+                    "Your video is still safe in Cartoon Clip Storage."
+                )
             )
-        )
+        except Exception as notify_error:
+            print(
+                "⚠️ Could not send failure notification: "
+                f"{type(notify_error).__name__}: {str(notify_error)}"
+            )
 
     finally:
-
-        # Delete temporary Render files.
         try:
-
             shutil.rmtree(
                 temp_directory,
                 ignore_errors=True
             )
-
         except Exception:
             pass
 
