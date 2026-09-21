@@ -2157,14 +2157,21 @@ async def process_original_video(
 
         print("Downloading original...")
 
-        # Use Telethon's lower-level download_file API with an explicit
-        # request size. 512 KiB is Telegram's safe MTProto media request
-        # size and avoids unnecessary tiny requests.
+        # Use Telethon's low-level downloader with the maximum supported
+        # chunk size (512 KiB). Telethon's download_file API expects
+        # part_size_kb, not request_size.
         downloaded_path = (
             await telethon_client.download_file(
                 original_message.media,
                 file=original_path,
-                request_size=512 * 1024,
+                part_size_kb=512,
+                file_size=(
+                    getattr(
+                        getattr(original_message, "file", None),
+                        "size",
+                        None,
+                    )
+                ),
                 progress_callback=download_callback,
             )
         )
