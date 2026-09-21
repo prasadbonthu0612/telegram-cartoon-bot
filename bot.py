@@ -26,6 +26,7 @@ from telegram.ext import (
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
+# Telethon automatically uses cryptg when installed. It significantly\n# reduces MTProto encryption/decryption CPU overhead during media transfers.\n
 
 # ============================================================
 # ENVIRONMENT VARIABLES
@@ -1230,199 +1231,16 @@ async def split_video(
     output_directory,
     progress=None,
 ):
-    """
-    Fast stream-copy video splitter.
-
-    Normal clips are kept between 30 and 45 seconds, targeting
-    approximately 40 seconds. The final clip may be shorter than
-    30 seconds when less than 30 seconds remain.
-
-    The video is NOT re-encoded. Split boundaries are selected from
-    existing video keyframes so the operation is much faster.
-    """
-
-    import json
+    """Split the video with FFmpeg and stream real progress to Telegram."""
 
     os.makedirs(
         output_directory,
         exist_ok=True
     )
 
-    MIN_SECONDS = 30.0
-    TARGET_SECONDS = 40.0
-    MAX_SECONDS = 45.0
-
     duration = get_video_duration(input_path)
+    estimated_parts = max(1, int((duration + 39.999) // 40))
     started = time.monotonic()
-
-    # --------------------------------------------------------
-    # Find existing video keyframes.
-    # --------------------------------------------------------
-
-    probe_command = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-skip_frame",
-        "nokey",
-        "-show_entries",
-        "frame=best_effort_timestamp_time",
-        "-of",
-        "json",
-        input_path,
-    ]
-
-    probe_result = await asyncio.create_subprocess_exec(
-        *probe_command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    probe_stdout, probe_stderr = await probe_result.communicate()
-
-    if probe_result.returncode != 0:
-        error_text = probe_stderr.decode(
-            "utf-8",
-            errors="replace"
-        ).strip()
-
-        raise RuntimeError(
-            "FFprobe failed to find video keyframes.\n"
-            f"{error_text[-2000:]}"
-        )
-
-    try:
-        probe_data = json.loads(
-            probe_stdout.decode(
-                "utf-8",
-                errors="replace"
-            )
-        )
-    except json.JSONDecodeError as e:
-        raise RuntimeError(
-            f"Could not parse FFprobe output: {e}"
-        )
-
-    keyframes = []
-
-    for frame in probe_data.get("frames", []):
-        value = frame.get(
-            "best_effort_timestamp_time"
-        )
-
-        if value is None:
-            continue
-
-        try:
-            timestamp = float(value)
-        except (TypeError, ValueError):
-            continue
-
-        if timestamp >= 0:
-            keyframes.append(timestamp)
-
-    keyframes = sorted(set(keyframes))
-
-    if not keyframes:
-        raise RuntimeError(
-            "No video keyframes were found. "
-            "Cannot perform safe stream-copy splitting."
-        )
-
-    print(
-        f"Video duration: {duration:.2f}s"
-    )
-    print(
-        f"Found {len(keyframes)} video keyframes."
-    )
-
-    # --------------------------------------------------------
-    # Select boundaries.
-    #
-    # Every normal boundary must be between 30 and 45 seconds
-    # after the previous boundary. We prefer approximately 40s.
-    # --------------------------------------------------------
-
-    split_points = []
-    current_start = 0.0
-
-    while True:
-
-        remaining = duration - current_start
-
-        # If the remaining section is <= 45 seconds, it becomes
-        # the final clip. It may therefore be shorter than 30s.
-        if remaining <= MAX_SECONDS:
-            break
-
-        minimum_boundary = current_start + MIN_SECONDS
-        target_boundary = current_start + TARGET_SECONDS
-        maximum_boundary = min(
-            current_start + MAX_SECONDS,
-            duration
-        )
-
-        candidates = [
-            timestamp
-            for timestamp in keyframes
-            if (
-                timestamp >= minimum_boundary
-                and timestamp <= maximum_boundary
-            )
-        ]
-
-        # Do not use a keyframe at the current starting point.
-        candidates = [
-            timestamp
-            for timestamp in candidates
-            if timestamp > current_start + 0.5
-        ]
-
-        if not candidates:
-            raise RuntimeError(
-                "Could not find a keyframe between "
-                f"{minimum_boundary:.2f}s and "
-                f"{maximum_boundary:.2f}s. "
-                "This video cannot be safely split into "
-                "30-45 second clips using stream-copy mode."
-            )
-
-        boundary = min(
-            candidates,
-            key=lambda timestamp: abs(
-                timestamp - target_boundary
-            )
-        )
-
-        clip_duration = boundary - current_start
-
-        if clip_duration < MIN_SECONDS:
-            raise RuntimeError(
-                f"Selected clip is only {clip_duration:.2f}s."
-            )
-
-        if clip_duration > MAX_SECONDS:
-            raise RuntimeError(
-                f"Selected clip is {clip_duration:.2f}s, "
-                "which exceeds the 45s maximum."
-            )
-
-        split_points.append(boundary)
-
-        print(
-            f"Selected split point: {boundary:.2f}s "
-            f"(clip {clip_duration:.2f}s)"
-        )
-
-        current_start = boundary
-
-    estimated_parts = len(split_points) + 1
-
-    # --------------------------------------------------------
-    # Stream-copy split.
-    # --------------------------------------------------------
 
     output_pattern = os.path.join(
         output_directory,
@@ -1438,51 +1256,45 @@ async def split_video(
         "1",
         "-progress",
         "pipe:1",
-
         "-i",
         input_path,
 
+        # Video
         "-map",
         "0:v:0",
 
+        # Audio if present
         "-map",
         "0:a:0?",
 
-        # IMPORTANT:
-        # No video/audio re-encoding.
-        "-c",
-        "copy",
-
-        "-f",
-        "segment",
-
-        "-segment_times",
-        ",".join(
-            f"{point:.6f}"
-            for point in split_points
-        ),
-
-        "-reset_timestamps",
-        "1",
-
-        "-segment_format",
-        "mp4",
-
+        # Re-encode so segments can be cleanly cut around ~40 seconds.
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
         "-movflags",
         "+faststart",
-
+        "-f",
+        "segment",
+        "-segment_time",
+        "40",
+        "-reset_timestamps",
+        "1",
+        "-segment_format",
+        "mp4",
         output_pattern,
     ]
 
-    print(
-        "Running FFmpeg stream-copy split:"
-    )
-    print(
-        " ".join(command)
-    )
-    print(
-        f"Estimated clips: {estimated_parts}"
-    )
+    print("Running FFmpeg:")
+    print(" ".join(command))
+    print(f"Video duration: {duration:.2f}s")
+    print(f"Estimated clips: {estimated_parts}")
 
     process = await asyncio.create_subprocess_exec(
         *command,
@@ -1490,113 +1302,67 @@ async def split_video(
         stderr=asyncio.subprocess.PIPE,
     )
 
-    stderr_task = asyncio.create_task(
-        process.stderr.read()
-    )
-
+    stderr_task = asyncio.create_task(process.stderr.read())
     current_seconds = 0.0
     last_percent = -1
 
     while True:
         line = await process.stdout.readline()
-
         if not line:
             break
 
-        line = line.decode(
-            "utf-8",
-            errors="replace"
-        ).strip()
-
+        line = line.decode("utf-8", errors="replace").strip()
         if not line or "=" not in line:
             continue
 
         key, value = line.split("=", 1)
 
-        if key != "out_time_ms":
-            continue
+        if key == "out_time_ms":
+            try:
+                current_seconds = int(value) / 1_000_000.0
+            except ValueError:
+                continue
 
-        try:
-            current_seconds = (
-                int(value) / 1_000_000.0
-            )
-        except ValueError:
-            continue
+            percent = min(100.0, (current_seconds / duration) * 100.0)
+            elapsed = time.monotonic() - started
 
-        percent = min(
-            100.0,
-            (current_seconds / duration) * 100.0
-        )
+            if percent > 0.1 and elapsed > 0:
+                estimated_total = elapsed / (percent / 100.0)
+                remaining = max(0.0, estimated_total - elapsed)
+            else:
+                remaining = None
 
-        elapsed = (
-            time.monotonic() - started
-        )
+            rounded_percent = int(percent)
 
-        if percent > 0.1 and elapsed > 0:
-            estimated_total = (
-                elapsed / (percent / 100.0)
-            )
-            remaining = max(
-                0.0,
-                estimated_total - elapsed
-            )
-        else:
-            remaining = None
-
-        rounded_percent = int(percent)
-
-        if (
-            progress
-            and rounded_percent != last_percent
-        ):
-            last_percent = rounded_percent
-
-            await progress.update(
-                "⚡ FAST SPLITTING VIDEO\n\n"
-                f"🎬 {progress.title}\n\n"
-                f"{make_progress_bar(percent)} "
-                f"{percent:5.1f}%\n\n"
-                f"⏱️ Elapsed: "
-                f"{format_duration(elapsed)}\n"
-                f"⏳ Remaining: "
-                f"{format_duration(remaining)}\n\n"
-                f"📹 Processed: "
-                f"{format_duration(current_seconds)} / "
-                f"{format_duration(duration)}\n"
-                f"✂️ Estimated parts: "
-                f"{estimated_parts}"
-            )
+            if progress and rounded_percent != last_percent:
+                last_percent = rounded_percent
+                await progress.update(
+                    "✂️ SPLITTING VIDEO\n\n"
+                    f"🎬 {progress.title}\n\n"
+                    f"{make_progress_bar(percent)} {percent:5.1f}%\n\n"
+                    f"⏱️ Elapsed: {format_duration(elapsed)}\n"
+                    f"⏳ Remaining: {format_duration(remaining)}\n\n"
+                    f"📹 Processed: {format_duration(current_seconds)} / "
+                    f"{format_duration(duration)}\n"
+                    f"✂️ Estimated parts: {estimated_parts}",
+                )
 
     return_code = await process.wait()
-
-    stderr_text = (
-        await stderr_task
-    ).decode(
-        "utf-8",
-        errors="replace"
-    ).strip()
+    stderr_text = (await stderr_task).decode("utf-8", errors="replace").strip()
 
     if return_code != 0:
         print("FFmpeg ERROR:")
         print(stderr_text)
-
         raise RuntimeError(
             "FFmpeg failed to split the video.\n"
             f"{stderr_text[-2000:]}"
         )
 
-    # --------------------------------------------------------
-    # Collect generated clips.
-    # --------------------------------------------------------
-
     clips = []
 
-    for filename in os.listdir(
-        output_directory
-    ):
+    for filename in os.listdir(output_directory):
         if not filename.endswith(".mp4"):
             continue
-
         if not filename.startswith("part_"):
             continue
 
@@ -1614,59 +1380,13 @@ async def split_video(
             "FFmpeg completed but produced no clips."
         )
 
-    # --------------------------------------------------------
-    # Validate every generated clip.
-    # --------------------------------------------------------
-
-    for index, clip_path in enumerate(
-        clips,
-        start=1
-    ):
-
-        clip_duration = get_video_duration(
-            clip_path
-        )
-
-        is_final_clip = (
-            index == len(clips)
-        )
-
-        print(
-            f"Clip {index}/{len(clips)}: "
-            f"{clip_duration:.2f}s"
-        )
-
-        # No clip may exceed 45 seconds.
-        if clip_duration > MAX_SECONDS + 0.5:
-            raise RuntimeError(
-                f"Clip {index} is "
-                f"{clip_duration:.2f}s, exceeding "
-                "the 45-second maximum."
-            )
-
-        # Every non-final clip must be at least 30 seconds.
-        if (
-            not is_final_clip
-            and clip_duration < MIN_SECONDS - 0.5
-        ):
-            raise RuntimeError(
-                f"Clip {index} is "
-                f"{clip_duration:.2f}s, below "
-                "the 30-second minimum."
-            )
-
-    elapsed_total = (
-        time.monotonic() - started
-    )
-
     if progress:
         await progress.finish(
-            "⚡ FAST SPLITTING COMPLETE\n\n"
+            "✂️ SPLITTING COMPLETE\n\n"
             f"🎬 {progress.title}\n\n"
             f"{make_progress_bar(100)} 100%\n\n"
             f"📦 Clips created: {len(clips)}\n"
-            f"⏱️ Split time: "
-            f"{format_duration(elapsed_total)}"
+            f"⏱️ Split time: {format_duration(time.monotonic() - started)}"
         )
 
     return clips
@@ -2437,10 +2157,14 @@ async def process_original_video(
 
         print("Downloading original...")
 
+        # Use Telethon's lower-level download_file API with an explicit
+        # request size. 512 KiB is Telegram's safe MTProto media request
+        # size and avoids unnecessary tiny requests.
         downloaded_path = (
-            await telethon_client.download_media(
-                original_message,
+            await telethon_client.download_file(
+                original_message.media,
                 file=original_path,
+                request_size=512 * 1024,
                 progress_callback=download_callback,
             )
         )
