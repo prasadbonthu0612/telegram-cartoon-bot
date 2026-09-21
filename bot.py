@@ -1718,14 +1718,67 @@ async def publish_one_queue_clip(
             f"{clip_index}/{queue.get('total_clips')}..."
         )
 
-        downloaded = await fast_download_telegram_media(
-            message,
-            local_path,
-        )
+        expected_size = getattr(getattr(message, "file", None), "size", None)
+        last_download_error = None
 
-        if not downloaded:
+        # The low-level Telethon download can return a falsy value even when
+        # the requested file was written successfully. It can also raise
+        # immediately after the final bytes are written. Never treat that
+        # situation as a failed download when the local file is complete.
+        for attempt in range(1, 4):
+            try:
+                downloaded = await fast_download_telegram_media(
+                    message,
+                    local_path,
+                )
+
+                if os.path.isfile(local_path):
+                    actual_size = os.path.getsize(local_path)
+
+                    if expected_size is None or actual_size >= expected_size:
+                        print(
+                            f"✅ Telegram clip {clip_index} download complete: "
+                            f"{actual_size} bytes."
+                        )
+                        break
+
+                    last_download_error = RuntimeError(
+                        f"Telegram clip {clip_index} download is incomplete "
+                        f"({actual_size} / {expected_size} bytes)."
+                    )
+                else:
+                    last_download_error = RuntimeError(
+                        f"Telegram clip {clip_index} download produced no local file."
+                    )
+
+            except Exception as download_error:
+                last_download_error = download_error
+
+                # Telethon may raise after writing the final bytes. Check the
+                # file before deciding that the download really failed.
+                if os.path.isfile(local_path):
+                    actual_size = os.path.getsize(local_path)
+
+                    if expected_size is None or actual_size >= expected_size:
+                        print(
+                            f"✅ Telegram clip {clip_index} reached the expected "
+                            f"size despite a final Telethon exception: "
+                            f"{actual_size} bytes."
+                        )
+                        break
+
+            if attempt < 3:
+                print(
+                    f"⏳ Telegram clip {clip_index} download incomplete "
+                    f"(attempt {attempt}/3). Retrying..."
+                )
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+                await asyncio.sleep(2)
+        else:
             raise RuntimeError(
-                f"Failed to download Telegram clip {clip_index}."
+                f"Failed to download Telegram clip {clip_index}: "
+                f"{type(last_download_error).__name__}: {last_download_error}"
             )
 
         media_id = await asyncio.to_thread(
@@ -1818,14 +1871,11 @@ async def get_last_successful_instagram_publish_time(manifests):
 async def process_pending_queues():
     """
     Scan Telegram queue manifests and publish at most ONE clip per
-    configured interval, but only during the daily Instagram publishing
-    window of 06:00 through 21:00 IST.
+    configured interval.
 
-    Outside that window, clips remain safely queued in Telegram and the
-    publisher resumes at 06:00 IST the next day.
-
-    A failed clip remains in Telegram and can be retried on a later
-    scan, subject to the same publishing interval and daily window.
+    The daily 06:00-21:00 IST publishing window is temporarily disabled
+    for testing. A failed clip remains in Telegram and can be retried on
+    a later scan, subject to the configured publishing interval.
     """
     if not INSTAGRAM_ACCESS_TOKEN or not INSTAGRAM_USER_ID:
         print(
@@ -1842,21 +1892,9 @@ async def process_pending_queues():
         return
 
     try:
-        # The Render server clock is not assumed to be India time.
-        # Always evaluate the publishing window explicitly in IST.
-        now_ist = datetime.now(INSTAGRAM_TIMEZONE)
-        current_minutes = now_ist.hour * 60 + now_ist.minute
-        start_minutes = INSTAGRAM_PUBLISH_START_HOUR * 60
-        end_minutes = INSTAGRAM_PUBLISH_END_HOUR * 60
-
-        if current_minutes < start_minutes or current_minutes > end_minutes:
-            print(
-                "🌙 Instagram publishing window is closed. "
-                f"Current IST: {now_ist.strftime('%H:%M:%S')}. "
-                "Next publishing window starts at 06:00 IST."
-            )
-            return
-
+        # TEMPORARILY DISABLED FOR TESTING:
+        # The 06:00-21:00 IST publishing window is intentionally bypassed.
+        # The 30-minute interval remains active.
         manifests = await find_queue_manifests()
 
         # Enforce the posting interval using timestamps persisted in the
@@ -2145,8 +2183,8 @@ async def instagram_queue_loop():
     Background loop for the Instagram queue.
 
     The worker checks every minute, but the persistent cooldown above
-    allows only ONE successful Reel publication every 30 minutes,
-    and only from 06:00 through 21:00 IST.
+    allows only ONE successful Reel publication every 30 minutes.
+    The daily publishing window is temporarily disabled for testing.
     """
     await asyncio.sleep(15)
 
