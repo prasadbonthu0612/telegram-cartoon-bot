@@ -26,6 +26,7 @@ from telegram.ext import (
 )
 
 from telethon import TelegramClient, events
+from telethon.errors import MessageNotModifiedError
 from telethon.sessions import StringSession
 
 
@@ -303,6 +304,29 @@ async def find_storage_channel():
 
 
 # ============================================================
+# SAFE TELEGRAM MESSAGE EDIT
+# ============================================================
+
+async def safe_telethon_edit_message(entity, message_id, new_text):
+    """Edit a Telethon message without treating an unchanged edit as a failure."""
+    try:
+        await telethon_client.edit_message(
+            entity,
+            message_id,
+            new_text
+        )
+        return True
+    except MessageNotModifiedError:
+        # Telegram already contains exactly this text. This is harmless and
+        # must never abort video processing or queue publishing.
+        print(
+            f"ℹ️ Telegram message {message_id} was already up to date; "
+            "skipping unchanged edit."
+        )
+        return False
+
+
+# ============================================================
 # SAVE ADMIN CHAT ID
 # ============================================================
 
@@ -351,7 +375,7 @@ async def save_admin_chat_id(chat_id):
                     f"{json.dumps({'admin_chat_id': chat_id})}"
                 )
 
-                await telethon_client.edit_message(
+                await safe_telethon_edit_message(
                     storage_channel,
                     message.id,
                     new_text
@@ -848,7 +872,7 @@ async def save_title_request(
             TITLE_REQUEST_MARKER
         ):
 
-            await telethon_client.edit_message(
+            await safe_telethon_edit_message(
                 storage_channel,
                 message.id,
                 request_text
@@ -973,7 +997,7 @@ async def save_processing_state(
             PROCESSING_MARKER
         ):
 
-            await telethon_client.edit_message(
+            await safe_telethon_edit_message(
                 storage_channel,
                 message.id,
                 text
@@ -1496,7 +1520,7 @@ async def save_queue_manifest(manifest_message, queue):
             f'Could not find "{STORAGE_CHANNEL_NAME}".'
         )
 
-    await telethon_client.edit_message(
+    await safe_telethon_edit_message(
         storage_channel,
         manifest_message.id,
         manifest_text
