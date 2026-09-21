@@ -2,6 +2,7 @@ import os
 import asyncio
 import threading
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -12,6 +13,7 @@ import urllib.parse
 import urllib.request
 
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from telegram import Update
@@ -26,7 +28,6 @@ from telegram.ext import (
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
-# Telethon automatically uses cryptg when installed. It significantly\n# reduces MTProto encryption/decryption CPU overhead during media transfers.\n
 
 # ============================================================
 # ENVIRONMENT VARIABLES
@@ -46,10 +47,16 @@ INSTAGRAM_API_VERSION = os.getenv("INSTAGRAM_API_VERSION", "v25.0")
 INSTAGRAM_API_BASE = f"https://graph.instagram.com/{INSTAGRAM_API_VERSION}"
 
 # Minimum time between successful Instagram Reel publications.
-# Default: 1 hour (3600 seconds).
+# Default: 30 minutes (1800 seconds).
 INSTAGRAM_POST_INTERVAL_SECONDS = int(
-    os.getenv("INSTAGRAM_POST_INTERVAL_SECONDS", "3600")
+    os.getenv("INSTAGRAM_POST_INTERVAL_SECONDS", "1800")
 )
+
+# Instagram publishing window in India Standard Time (IST).
+# Posts are allowed from 06:00 through 21:00 IST, inclusive.
+INSTAGRAM_TIMEZONE = ZoneInfo("Asia/Kolkata")
+INSTAGRAM_PUBLISH_START_HOUR = 6
+INSTAGRAM_PUBLISH_END_HOUR = 21
 
 # Send a reminder in the private Telegram storage channel when the bot is idle.
 # Default: every 30 minutes (1800 seconds).
@@ -92,14 +99,6 @@ pending_video_message_id = None
 # token -> {"path": local_file_path, "content_type": "video/mp4"}
 public_media_files = {}
 public_media_lock = threading.Lock()
-
-# Instagram / Meta transient rate-limit state.
-# When Meta returns a rate-limit response, the queue publisher pauses all
-# Instagram API attempts until this timestamp. The Telegram clips remain
-# safely stored and are retried automatically after the cooldown.
-instagram_rate_limit_until = 0.0
-instagram_rate_limit_reason = None
-instagram_rate_limit_notified_until = 0.0
 
 
 # ============================================================
@@ -426,160 +425,10 @@ async def load_admin_chat_id():
 # INSTAGRAM API
 # ============================================================
 
-class InstagramRateLimitError(RuntimeError):
-    """Raised when Meta tells us the Instagram API is temporarily rate-limited."""
-
-    def __init__(self, message, retry_after=None):
-        super().__init__(message)
-        self.retry_after = retry_after
-
-
-def _safe_json_loads(value):
-    if not value:
-        return None
-    try:
-        return json.loads(value)
-    except Exception:
-        return None
-
-
-def _find_regain_time(value):
-    """Recursively find Meta's estimated_time_to_regain_access value."""
-    if isinstance(value, dict):
-        for key, child in value.items():
-            if key == "estimated_time_to_regain_access":
-                try:
-                    return float(child)
-                except (TypeError, ValueError):
-                    pass
-            found = _find_regain_time(child)
-            if found is not None:
-                return found
-    elif isinstance(value, list):
-        for child in value:
-            found = _find_regain_time(child)
-            if found is not None:
-                return found
-    return None
-
-
-def _extract_instagram_rate_limit_info(headers, data):
-    """Return (is_rate_limited, retry_seconds, reason)."""
-    error = data.get("error", {}) if isinstance(data, dict) else {}
-    code = error.get("code")
-    subcode = error.get("error_subcode")
-    is_transient = error.get("is_transient") is True
-    message = str(error.get("message", ""))
-    title = str(error.get("error_user_title", ""))
-
-    rate_limit_text = " ".join(
-        value.lower()
-        for value in (message, title)
-        if value
-    )
-
-    # Current Meta error seen by this bot is code 4, subcode 1349210,
-    # with an explicit "Rate Limit Exceeded" message. Keep detection
-    # focused enough to avoid misclassifying unrelated 403 errors.
-    is_rate_limit = (
-        code == 4
-        or subcode == 1349210
-        or "rate limit" in rate_limit_text
-        or "rate-limit" in rate_limit_text
-    )
-
-    # Some Meta throttles expose a Retry-After header.
-    retry_after = None
-    try:
-        header_value = headers.get("Retry-After") if headers else None
-        if header_value:
-            retry_after = max(0.0, float(header_value))
-    except (TypeError, ValueError):
-        pass
-
-    # Meta's business-use-case header can contain an estimated time to
-    # regain access. It is JSON and its exact nesting can vary.
-    usage_header = None
-    if headers:
-        usage_header = (
-            headers.get("X-Business-Use-Case-Usage")
-            or headers.get("x-business-use-case-usage")
-        )
-
-    if usage_header:
-        usage_data = _safe_json_loads(usage_header)
-        estimated = _find_regain_time(usage_data)
-        if estimated is not None:
-            # Meta's value is generally expressed in minutes.
-            estimated_seconds = max(0.0, estimated * 60.0)
-            retry_after = max(retry_after or 0.0, estimated_seconds)
-
-    reason = (
-        f"Meta rate limit detected (HTTP response code={code}, "
-        f"subcode={subcode}, transient={is_transient})."
-    )
-
-    return is_rate_limit, retry_after, reason
-
-
-def _activate_instagram_rate_limit(retry_after=None, reason=None):
-    """Pause Instagram API publishing for a conservative cooldown."""
-    global instagram_rate_limit_until
-    global instagram_rate_limit_reason
-
-    # If Meta supplied a duration, honor it with a small safety margin.
-    # Otherwise use a 15-minute minimum pause. This prevents the queue loop
-    # from repeatedly hitting the same throttled API node every minute.
-    if retry_after is None:
-        cooldown = 15 * 60
-    else:
-        cooldown = max(float(retry_after), 15 * 60)
-        cooldown += 30
-
-    proposed_until = time.time() + cooldown
-    instagram_rate_limit_until = max(
-        instagram_rate_limit_until,
-        proposed_until,
-    )
-    instagram_rate_limit_reason = reason or "Instagram API rate limit."
-
-    remaining = max(0, int(instagram_rate_limit_until - time.time()))
-    print(
-        "⏳ Instagram API rate limit active. "
-        f"Publishing paused for about {remaining // 60}m {remaining % 60:02d}s."
-    )
-
-
-def _raise_instagram_api_error(http_code, data, headers=None):
-    is_rate_limit, retry_after, reason = _extract_instagram_rate_limit_info(
-        headers or {},
-        data,
-    )
-
-    if is_rate_limit:
-        message = (
-            f"Instagram API HTTP {http_code}: "
-            f"{json.dumps(data, ensure_ascii=False)}"
-        )
-        _activate_instagram_rate_limit(retry_after, reason)
-        raise InstagramRateLimitError(
-            message,
-            retry_after=retry_after,
-        )
-
-    raise RuntimeError(
-        f"Instagram API HTTP {http_code}: "
-        f"{json.dumps(data, ensure_ascii=False)}"
-    )
-
-
 def instagram_api_get(path, params=None):
     """
     Make a GET request to the current Instagram API using the
     Instagram Login access token stored in Render environment variables.
-
-    Rate-limit responses are converted into InstagramRateLimitError so the
-    queue can pause instead of retrying the same throttled API every minute.
     """
     if not INSTAGRAM_ACCESS_TOKEN:
         raise RuntimeError("INSTAGRAM_ACCESS_TOKEN is missing.")
@@ -614,14 +463,9 @@ def instagram_api_get(path, params=None):
         except Exception:
             data = {"raw": body}
 
-        _raise_instagram_api_error(
-            e.code,
-            data,
-            getattr(e, "headers", None),
+        raise RuntimeError(
+            f"Instagram API HTTP {e.code}: {json.dumps(data, ensure_ascii=False)}"
         )
-
-    except InstagramRateLimitError:
-        raise
 
     except Exception as e:
         raise RuntimeError(
@@ -633,9 +477,6 @@ def instagram_api_post(path, params=None):
     """
     Make a form-encoded POST request to the Instagram Graph API.
     The access token is stored only in Render environment variables.
-
-    Rate-limit responses are converted into InstagramRateLimitError so the
-    queue can pause instead of retrying the same throttled API every minute.
     """
     if not INSTAGRAM_ACCESS_TOKEN:
         raise RuntimeError("INSTAGRAM_ACCESS_TOKEN is missing.")
@@ -673,14 +514,10 @@ def instagram_api_post(path, params=None):
         except Exception:
             data = {"raw": body_text}
 
-        _raise_instagram_api_error(
-            e.code,
-            data,
-            getattr(e, "headers", None),
+        raise RuntimeError(
+            f"Instagram API HTTP {e.code}: "
+            f"{json.dumps(data, ensure_ascii=False)}"
         )
-
-    except InstagramRateLimitError:
-        raise
 
     except Exception as e:
         raise RuntimeError(
@@ -760,8 +597,6 @@ def publish_reel_from_file(file_path, title, part_index, total_parts):
                 "media_type": "REELS",
                 "video_url": public_url,
                 "caption": caption,
-                # Keep this as a Reel only; do not also place it in
-                # the main Instagram Feed/grid.
                 "share_to_feed": "false",
             }
         )
@@ -779,20 +614,13 @@ def publish_reel_from_file(file_path, title, part_index, total_parts):
         )
 
         # Instagram needs time to download/transcode the video.
-        # Poll with increasing intervals instead of hitting the API every
-        # five seconds. This is much friendlier to Meta's rate limits while
-        # still checking frequently enough for normal Reel processing.
+        # Poll until the container is ready.
         max_attempts = 60
-        poll_schedule = [10, 15, 20, 30, 45, 60]
+        poll_seconds = 5
 
         for attempt in range(1, max_attempts + 1):
 
-            wait_seconds = poll_schedule[min(attempt - 1, len(poll_schedule) - 1)]
-            print(
-                f"⏱️ Waiting {wait_seconds}s before Instagram status check "
-                f"{attempt}/{max_attempts}..."
-            )
-            time.sleep(wait_seconds)
+            time.sleep(poll_seconds)
 
             _, status_data = instagram_api_get(
                 creation_id,
@@ -826,12 +654,9 @@ def publish_reel_from_file(file_path, title, part_index, total_parts):
                 )
 
         else:
-            total_wait = sum(poll_schedule[:len(poll_schedule)]) + (
-                max_attempts - len(poll_schedule)
-            ) * poll_schedule[-1]
             raise RuntimeError(
-                "Instagram video processing timed out after approximately "
-                f"{total_wait} seconds."
+                "Instagram video processing timed out after "
+                f"{max_attempts * poll_seconds} seconds."
             )
 
         print(
@@ -1304,267 +1129,18 @@ def build_instagram_caption(title, part_index, total_parts):
 
 
 # ============================================================
-# PROGRESS / VIDEO SPLITTING
+# SPLIT VIDEO
 # ============================================================
 
-class TelegramProgress:
-    """Edit one Telegram message instead of sending many progress messages."""
-
-    def __init__(self, chat_id, title, prefix=""):
-        self.chat_id = chat_id
-        self.title = title
-        self.prefix = prefix
-        self.message = None
-        self.last_update = 0.0
-        self.min_update_interval = 2.0
-
-    async def start(self, text):
-        self.message = await bot_application.bot.send_message(
-            chat_id=self.chat_id,
-            text=text,
-        )
-        self.last_update = time.monotonic()
-        return self.message
-
-    async def update(self, text, force=False):
-        if not self.message:
-            return
-
-        now = time.monotonic()
-        if not force and now - self.last_update < self.min_update_interval:
-            return
-
-        try:
-            await self.message.edit_text(text)
-            self.last_update = now
-        except Exception as e:
-            print(
-                "⚠️ Could not update Telegram progress message: "
-                f"{type(e).__name__}: {str(e)}"
-            )
-
-    async def finish(self, text):
-        await self.update(text, force=True)
-
-
-def make_progress_bar(percent, width=20):
-    percent = max(0.0, min(100.0, float(percent)))
-    filled = int(round(width * percent / 100.0))
-    filled = max(0, min(width, filled))
-    return "█" * filled + "░" * (width - filled)
-
-
-def format_duration(seconds):
-    if seconds is None or seconds < 0:
-        return "--:--"
-
-    seconds = int(seconds)
-    hours, remainder = divmod(seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-
-    if hours:
-        return f"{hours}h {minutes:02d}m {seconds:02d}s"
-    return f"{minutes:02d}m {seconds:02d}s"
-
-
-def get_video_duration(input_path):
-    """Return the input video's duration in seconds using ffprobe."""
+async def get_video_duration(input_path):
+    """Return the source video's duration in seconds using ffprobe."""
     command = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        input_path,
-    ]
-
-    result = subprocess.run(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            "Could not determine video duration with ffprobe.\n"
-            f"{result.stderr.strip()}"
-        )
-
-    try:
-        duration = float(result.stdout.strip())
-    except ValueError:
-        raise RuntimeError(
-            f"ffprobe returned an invalid duration: {result.stdout!r}"
-        )
-
-    if duration <= 0:
-        raise RuntimeError("Video duration is zero or invalid.")
-
-    return duration
-
-
-async def split_video(
-    input_path,
-    output_directory,
-    progress=None,
-):
-    """
-    Split the video WITHOUT re-encoding.
-
-    Uses ffprobe to find keyframes, chooses boundaries between
-    30 and 45 seconds (preferably near 40 seconds), then uses
-    FFmpeg stream copy (-c copy).
-    """
-
-    os.makedirs(output_directory, exist_ok=True)
-
-    duration = get_video_duration(input_path)
-    started = time.monotonic()
-
-    if progress:
-        await progress.update(
-            "⚡ FAST SPLITTING VIDEO\n\n"
-            f"🎬 {progress.title}\n\n"
-            "🔎 Finding keyframes...\n"
-            "No video re-encoding will be performed.",
-            force=True,
-        )
-
-    # Find video keyframes.
-    probe_command = [
         "ffprobe",
         "-v", "error",
-        "-select_streams", "v:0",
-        "-skip_frame", "nokey",
-        "-show_entries", "frame=best_effort_timestamp_time",
-        "-of", "csv=p=0",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
         input_path,
     ]
-
-    probe_result = await asyncio.to_thread(
-        subprocess.run,
-        probe_command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-    if probe_result.returncode != 0:
-        raise RuntimeError(
-            "Could not read video keyframes with ffprobe.\n"
-            f"{probe_result.stderr.strip()}"
-        )
-
-    keyframes = [0.0]
-
-    for line in probe_result.stdout.splitlines():
-        value = line.strip().strip(",")
-        if not value:
-            continue
-        try:
-            timestamp = float(value)
-        except ValueError:
-            continue
-        if timestamp >= 0:
-            keyframes.append(timestamp)
-
-    keyframes = sorted(set(keyframes))
-
-    if len(keyframes) < 2 and duration > 45:
-        raise RuntimeError(
-            "The video does not contain enough keyframes to create "
-            "30–45 second clips without re-encoding."
-        )
-
-    # Choose keyframe boundaries. Every non-final clip is 30–45 sec.
-    boundaries = []
-    current = 0.0
-
-    while duration - current > 45.0:
-        minimum = current + 30.0
-        maximum = min(current + 45.0, duration)
-
-        candidates = [
-            keyframe
-            for keyframe in keyframes
-            if keyframe > minimum + 0.001
-            and keyframe <= maximum + 0.001
-        ]
-
-        if not candidates:
-            raise RuntimeError(
-                "Could not find a safe keyframe between "
-                f"{minimum:.2f}s and {maximum:.2f}s. "
-                "A 30–45 second stream-copy split is not possible "
-                "for this video without re-encoding."
-            )
-
-        target = current + 40.0
-        boundary = min(
-            candidates,
-            key=lambda value: abs(value - target),
-        )
-
-        if boundary <= current:
-            raise RuntimeError("Invalid keyframe boundary detected.")
-
-        boundaries.append(boundary)
-        current = boundary
-
-    # Final segment is allowed to be under 30 seconds.
-    if duration > current + 0.001:
-        boundaries.append(duration)
-
-    estimated_parts = len(boundaries)
-
-    if progress:
-        await progress.update(
-            "⚡ FAST SPLITTING VIDEO\n\n"
-            f"🎬 {progress.title}\n\n"
-            "🔎 Keyframes found\n"
-            f"📦 Planned clips: {estimated_parts}\n"
-            "🚀 Starting stream-copy split...",
-            force=True,
-        )
-
-    output_pattern = os.path.join(
-        output_directory,
-        "part_%03d.mp4",
-    )
-
-    # segment_times contains only actual split points.
-    # FFmpeg creates the final segment automatically.
-    segment_times = ",".join(
-        f"{value:.6f}" for value in boundaries[:-1]
-    )
-
-    command = [
-        "ffmpeg",
-        "-y",
-        "-loglevel", "error",
-        "-i", input_path,
-        "-map", "0:v:0",
-        "-map", "0:a:0?",
-        "-c", "copy",
-        "-avoid_negative_ts", "make_zero",
-        "-reset_timestamps", "1",
-        "-segment_format", "mp4",
-        "-f", "segment",
-        "-segment_times", segment_times,
-        output_pattern,
-    ]
-
-    print("Running FAST FFmpeg stream-copy split:")
-    print(" ".join(command))
-    print(f"Video duration: {duration:.2f}s")
-    print(f"Planned clips: {estimated_parts}")
-    print(
-        "Selected boundaries: "
-        + ", ".join(f"{value:.2f}s" for value in boundaries)
-    )
 
     process = await asyncio.create_subprocess_exec(
         *command,
@@ -1572,82 +1148,236 @@ async def split_video(
         stderr=asyncio.subprocess.PIPE,
     )
 
-    _, stderr_data = await process.communicate()
+    stdout, stderr = await process.communicate()
 
     if process.returncode != 0:
-        stderr_text = stderr_data.decode(
-            "utf-8",
-            errors="replace",
-        ).strip()
-
-        print("FFmpeg ERROR:")
-        print(stderr_text)
-
         raise RuntimeError(
-            "FFmpeg failed to split the video.\n"
-            f"{stderr_text[-2000:]}"
+            "Could not read video duration with ffprobe.\n"
+            f"{stderr.decode(errors='replace').strip()}"
         )
 
-    # Collect generated clips.
-    clips = []
+    try:
+        duration = float(stdout.decode().strip())
+    except ValueError as e:
+        raise RuntimeError("ffprobe returned an invalid video duration.") from e
 
+    if duration <= 0:
+        raise RuntimeError("Video duration is zero or invalid.")
+
+    return duration
+
+
+def format_duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {seconds:02d}s"
+    return f"{minutes}m {seconds:02d}s"
+
+
+def progress_bar(percent, width=20):
+    percent = max(0.0, min(100.0, float(percent)))
+    filled = int(round(width * percent / 100))
+    return "█" * filled + "░" * (width - filled)
+
+
+class TelegramProgressReporter:
+    """Edit one Telegram message at a controlled rate instead of spamming messages."""
+
+    def __init__(self, bot, chat_id, message_id, min_interval=2.0):
+        self.bot = bot
+        self.chat_id = chat_id
+        self.message_id = message_id
+        self.min_interval = min_interval
+        self.last_update = 0.0
+        self.last_text = None
+        self.lock = asyncio.Lock()
+
+    async def edit(self, text, force=False):
+        now = time.monotonic()
+        if not force and now - self.last_update < self.min_interval:
+            return False
+        if text == self.last_text:
+            return False
+
+        async with self.lock:
+            now = time.monotonic()
+            if not force and now - self.last_update < self.min_interval:
+                return False
+            if text == self.last_text:
+                return False
+
+            try:
+                await self.bot.edit_message_text(
+                    chat_id=self.chat_id,
+                    message_id=self.message_id,
+                    text=text,
+                )
+                self.last_update = now
+                self.last_text = text
+                return True
+            except Exception as e:
+                # Telegram can occasionally reject an edit because the text
+                # is unchanged or because of a transient API condition.
+                print(
+                    f"⚠️ Progress message update failed: "
+                    f"{type(e).__name__}: {str(e)}"
+                )
+                return False
+
+    def schedule(self, text, force=False):
+        """Schedule an edit from synchronous Telethon/FFmpeg callbacks."""
+        now = time.monotonic()
+        if not force and now - self.last_update < self.min_interval:
+            return
+        asyncio.create_task(self.edit(text, force=force))
+
+
+async def split_video(
+    input_path,
+    output_directory,
+    progress_reporter=None,
+    title="Video",
+):
+    """Split the source into ~60s MP4 clips while reporting live FFmpeg progress."""
+    os.makedirs(output_directory, exist_ok=True)
+
+    output_pattern = os.path.join(
+        output_directory,
+        "part_%03d.mp4"
+    )
+
+    duration = await get_video_duration(input_path)
+    expected_parts = max(1, math.ceil(duration / 60.0))
+    started = time.monotonic()
+    last_report = 0.0
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", input_path,
+
+        "-map", "0:v:0",
+        "-map", "0:a:0?",
+
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+
+        "-f", "segment",
+        "-segment_time", "60",
+        "-reset_timestamps", "1",
+        "-segment_format", "mp4",
+
+        # Machine-readable progress for the Telegram progress display.
+        "-progress", "pipe:1",
+        "-nostats",
+
+        output_pattern,
+    ]
+
+    print("Running FFmpeg:")
+    print(" ".join(command))
+
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    current_seconds = 0.0
+
+    while True:
+        line = await process.stdout.readline()
+        if not line:
+            break
+
+        line = line.decode(errors="replace").strip()
+
+        if line.startswith("out_time_ms="):
+            try:
+                # FFmpeg reports out_time_ms in microseconds.
+                current_seconds = max(
+                    0.0,
+                    int(line.split("=", 1)[1]) / 1_000_000.0
+                )
+            except ValueError:
+                continue
+
+            percent = min(100.0, (current_seconds / duration) * 100.0)
+            elapsed = max(0.01, time.monotonic() - started)
+            eta = (
+                elapsed * (100.0 - percent) / percent
+                if percent > 0.5
+                else 0
+            )
+
+            # Count clips already materialized by FFmpeg.
+            created = len([
+                name for name in os.listdir(output_directory)
+                if name.startswith("part_") and name.endswith(".mp4")
+            ])
+
+            now = time.monotonic()
+            if progress_reporter and (
+                now - last_report >= 2.0 or percent >= 100.0
+            ):
+                last_report = now
+                await progress_reporter.edit(
+                    "✂️ SPLITTING VIDEO\n\n"
+                    f"🎬 {title}\n\n"
+                    f"{progress_bar(percent)} {percent:5.1f}%\n\n"
+                    f"⏱️ Elapsed: {format_duration(elapsed)}\n"
+                    f"⏳ ETA: ~{format_duration(eta)}\n\n"
+                    f"📹 Duration: {format_duration(duration)}\n"
+                    f"✂️ Parts created: {created}/{expected_parts}"
+                )
+
+    stderr = await process.stderr.read()
+    return_code = await process.wait()
+
+    if return_code != 0:
+        error_text = stderr.decode(errors="replace").strip()
+        print("FFmpeg ERROR:")
+        print(error_text)
+        raise RuntimeError(
+            "FFmpeg failed to split the video.\n"
+            f"{error_text[-2000:]}"
+        )
+
+    clips = []
     for filename in os.listdir(output_directory):
         if filename.endswith(".mp4") and filename.startswith("part_"):
-            clips.append(
-                os.path.join(output_directory, filename)
-            )
+            clips.append(os.path.join(output_directory, filename))
 
     clips.sort()
 
     if not clips:
-        raise RuntimeError(
-            "FFmpeg completed but produced no clips."
-        )
-
-    # Validate: no clip may exceed 45 seconds.
-    # Final clip may be shorter than 30 seconds.
-    clip_durations = []
-
-    for clip_path in clips:
-        clip_duration = get_video_duration(clip_path)
-        clip_durations.append(clip_duration)
-
-        if clip_duration > 45.5:
-            raise RuntimeError(
-                f"Generated clip {os.path.basename(clip_path)} "
-                f"is {clip_duration:.2f}s, exceeding the 45-second maximum."
-            )
+        raise RuntimeError("FFmpeg completed but produced no clips.")
 
     elapsed = time.monotonic() - started
-
-    if progress:
-        await progress.finish(
-            "⚡ FAST SPLITTING COMPLETE\n\n"
-            f"🎬 {progress.title}\n\n"
-            f"{make_progress_bar(100)} 100%\n\n"
-            f"📦 Clips created: {len(clips)}\n"
-            f"⏱️ Split time: {format_duration(elapsed)}\n"
-            f"📏 Durations: "
-            + ", ".join(f"{value:.1f}s" for value in clip_durations)
+    if progress_reporter:
+        await progress_reporter.edit(
+            "✂️ SPLITTING COMPLETE\n\n"
+            f"🎬 {title}\n\n"
+            f"{progress_bar(100)} 100.0%\n\n"
+            f"⏱️ Time taken: {format_duration(elapsed)}\n"
+            f"✂️ Parts created: {len(clips)}/{expected_parts}",
+            force=True,
         )
 
-    print(
-        f"FAST split complete in {elapsed:.2f}s. "
-        f"Created {len(clips)} clips."
-    )
-    print(
-        "Clip durations: "
-        + ", ".join(f"{value:.2f}s" for value in clip_durations)
-    )
-
-    return clips
+    return clips, duration
 
 
 # ============================================================
 # CREATE QUEUE MANIFEST
 # ============================================================
-
-
 
 async def create_automatic_queue(
     storage_channel,
@@ -1968,33 +1698,19 @@ async def get_last_successful_instagram_publish_time(manifests):
 async def process_pending_queues():
     """
     Scan Telegram queue manifests and publish at most ONE clip per
-    configured interval. The default interval is one hour.
+    configured interval, but only during the daily Instagram publishing
+    window of 06:00 through 21:00 IST.
+
+    Outside that window, clips remain safely queued in Telegram and the
+    publisher resumes at 06:00 IST the next day.
 
     A failed clip remains in Telegram and can be retried on a later
-    scan, subject to the same publishing interval.
+    scan, subject to the same publishing interval and daily window.
     """
     if not INSTAGRAM_ACCESS_TOKEN or not INSTAGRAM_USER_ID:
         print(
             "⚠️ Instagram credentials are missing. "
             "Queue publisher is disabled."
-        )
-        return
-
-    # Meta can temporarily throttle the API node used by the application.
-    # Once that happens, do not make another Instagram API request every
-    # minute. The queue remains in Telegram and this worker automatically
-    # resumes after the cooldown.
-    global instagram_rate_limit_until
-    global instagram_rate_limit_notified_until
-
-    if time.time() < instagram_rate_limit_until:
-        remaining = max(
-            0,
-            int(instagram_rate_limit_until - time.time())
-        )
-        print(
-            "⏳ Instagram API rate-limit cooldown active. "
-            f"Retrying in about {remaining // 60}m {remaining % 60:02d}s."
         )
         return
 
@@ -2006,11 +1722,26 @@ async def process_pending_queues():
         return
 
     try:
+        # The Render server clock is not assumed to be India time.
+        # Always evaluate the publishing window explicitly in IST.
+        now_ist = datetime.now(INSTAGRAM_TIMEZONE)
+        current_minutes = now_ist.hour * 60 + now_ist.minute
+        start_minutes = INSTAGRAM_PUBLISH_START_HOUR * 60
+        end_minutes = INSTAGRAM_PUBLISH_END_HOUR * 60
+
+        if current_minutes < start_minutes or current_minutes > end_minutes:
+            print(
+                "🌙 Instagram publishing window is closed. "
+                f"Current IST: {now_ist.strftime('%H:%M:%S')}. "
+                "Next publishing window starts at 06:00 IST."
+            )
+            return
+
         manifests = await find_queue_manifests()
 
         # Enforce the posting interval using timestamps persisted in the
         # Telegram queue manifests. This prevents a Render restart or a
-        # manual /publish_queue command from bypassing the one-hour limit.
+        # manual /publish_queue command from bypassing the 30-minute limit.
         last_publish = await get_last_successful_instagram_publish_time(
             manifests
         )
@@ -2138,55 +1869,6 @@ async def process_pending_queues():
 
                 # Publish only one clip per scan. This avoids
                 # hammering the API and makes failures isolated.
-                return
-
-            except InstagramRateLimitError as e:
-                target_clip["status"] = "FAILED"
-                target_clip["instagram_status"] = "FAILED"
-
-                await save_queue_manifest(
-                    manifest_message,
-                    queue
-                )
-
-                remaining = max(
-                    0,
-                    int(instagram_rate_limit_until - time.time())
-                )
-
-                print(
-                    "⏳ Instagram API rate limit reached. "
-                    "The queue is paused safely.\n"
-                    f"Retry window: about {remaining // 60}m "
-                    f"{remaining % 60:02d}s.\n"
-                    f"Details: {str(e)}"
-                )
-
-                # Notify once for the active cooldown instead of sending a
-                # new failure message every minute while Meta is throttling.
-                now_timestamp = time.time()
-                should_notify = (
-                    now_timestamp >= instagram_rate_limit_notified_until
-                )
-
-                if should_notify and admin_chat_id:
-                    instagram_rate_limit_notified_until = instagram_rate_limit_until
-                    await bot_application.bot.send_message(
-                        chat_id=admin_chat_id,
-                        text=(
-                            "⏳ INSTAGRAM API RATE LIMIT\n\n"
-                            f"🎬 {queue.get('title', 'Cartoon')}\n"
-                            f"📌 Part: {clip_index}/{queue.get('total_clips', len(clips))}\n\n"
-                            "Meta has temporarily rate-limited the Instagram API.\n"
-                            f"⏸️ Publishing paused for about {remaining // 60}m "
-                            f"{remaining % 60:02d}s.\n\n"
-                            "⚠️ The Telegram clip was NOT deleted.\n"
-                            "It will remain safely stored and the bot will "
-                            "retry automatically after the cooldown.\n\n"
-                            "📥 Telegram download/split/upload pipeline is unaffected."
-                        )
-                    )
-
                 return
 
             except Exception as e:
@@ -2335,7 +2017,8 @@ async def instagram_queue_loop():
     Background loop for the Instagram queue.
 
     The worker checks every minute, but the persistent cooldown above
-    allows only ONE successful Reel publication every hour by default.
+    allows only ONE successful Reel publication every 30 minutes,
+    and only from 06:00 through 21:00 IST.
     """
     await asyncio.sleep(15)
 
@@ -2373,6 +2056,7 @@ async def process_original_video(
     )
 
     if storage_channel is None:
+
         raise RuntimeError(
             f'Could not find "{STORAGE_CHANNEL_NAME}".'
         )
@@ -2387,6 +2071,7 @@ async def process_original_video(
     )
 
     try:
+
         # ----------------------------------------------------
         # Find original
         # ----------------------------------------------------
@@ -2404,17 +2089,19 @@ async def process_original_video(
         )
 
         if not original_message:
+
             raise RuntimeError(
                 "Original video message could not be found."
             )
 
         if not original_message.video:
+
             raise RuntimeError(
                 "The stored message is not a video."
             )
 
         # ----------------------------------------------------
-        # Download original with live progress
+        # Download original
         # ----------------------------------------------------
 
         original_path = os.path.join(
@@ -2422,103 +2109,56 @@ async def process_original_video(
             "original.mp4"
         )
 
-        download_progress = TelegramProgress(
-            admin_chat_id,
-            title,
-        )
-
-        await download_progress.start(
-            "⏳ PROCESSING STARTED\n\n"
-            f"🎬 {title}\n\n"
-            "📥 DOWNLOADING ORIGINAL\n\n"
-            "Starting..."
-        )
-
-        download_started = time.monotonic()
-        download_last_update = [0.0]
-
-        async def update_download_progress(current, total):
-            if not total:
-                return
-
-            percent = (current / total) * 100.0
-            elapsed = time.monotonic() - download_started
-
-            if percent > 0.1 and elapsed > 0:
-                speed = current / elapsed
-                remaining = (total - current) / speed if speed > 0 else None
-            else:
-                speed = 0
-                remaining = None
-
-            await download_progress.update(
-                "📥 DOWNLOADING ORIGINAL\n\n"
+        progress_message = await bot_application.bot.send_message(
+            chat_id=admin_chat_id,
+            text=(
+                "⏳ PROCESSING STARTED\n\n"
                 f"🎬 {title}\n\n"
-                f"{make_progress_bar(percent)} {percent:5.1f}%\n\n"
-                f"⏱️ Elapsed: {format_duration(elapsed)}\n"
-                f"⏳ Remaining: {format_duration(remaining)}\n"
-                f"📦 Downloaded: {current / 1024 / 1024:.1f} / "
-                f"{total / 1024 / 1024:.1f} MB\n"
-                f"🚀 Speed: {speed / 1024 / 1024:.2f} MB/s"
+                "📥 Downloading original video..."
             )
+        )
 
-        def download_callback(current, total):
-            now = time.monotonic()
-            if total and (
-                now - download_last_update[0] >= 2.0
-                or current >= total
-            ):
-                download_last_update[0] = now
-                asyncio.create_task(
-                    update_download_progress(current, total)
-                )
+        progress_reporter = TelegramProgressReporter(
+            bot_application.bot,
+            admin_chat_id,
+            progress_message.message_id,
+            min_interval=2.0,
+        )
 
         print("Downloading original...")
 
-        # Use Telethon's low-level downloader with the maximum supported
-        # chunk size (512 KiB). This reduces the number of Telegram
-        # transfer requests. cryptg (installed in requirements.txt)
-        # handles MTProto encryption/decryption in C.
-        #
-        # IMPORTANT:
-        # download_file() returns None when writing directly to a file,
-        # so success is checked using the actual file on disk rather than
-        # testing the return value.
-        original_file_size = getattr(
-            getattr(original_message, "file", None),
-            "size",
-            None,
-        )
+        download_started = time.monotonic()
 
-        downloaded_result = await telethon_client.download_file(
-            original_message.media,
+        def download_progress(current, total):
+            if not total:
+                return
+            percent = (current / total) * 100.0
+            elapsed = max(0.01, time.monotonic() - download_started)
+            speed = current / elapsed
+            remaining_bytes = max(0, total - current)
+            eta = remaining_bytes / speed if speed > 0 else 0
+            progress_reporter.schedule(
+                "📥 DOWNLOADING ORIGINAL\n\n"
+                f"🎬 {title}\n\n"
+                f"{progress_bar(percent)} {percent:5.1f}%\n\n"
+                f"📦 {current / 1024 / 1024:.1f} / {total / 1024 / 1024:.1f} MB\n"
+                f"⚡ {speed / 1024 / 1024:.2f} MB/s\n"
+                f"⏳ ETA: ~{format_duration(eta)}"
+            )
+
+        downloaded_path = await telethon_client.download_media(
+            original_message,
             file=original_path,
-            part_size_kb=512,
-            file_size=original_file_size,
-            progress_callback=download_callback,
+            progress_callback=download_progress,
         )
 
-        # When a file path is supplied, Telethon writes the data directly
-        # to that path. Verify the actual file exists and is non-empty.
-        if not os.path.isfile(original_path):
+        if not downloaded_path:
             raise RuntimeError(
                 "Failed to download original video."
             )
 
-        if os.path.getsize(original_path) <= 0:
-            raise RuntimeError(
-                "Downloaded original video is empty."
-            )
-
-        await download_progress.finish(
-            "📥 DOWNLOAD COMPLETE\n\n"
-            f"🎬 {title}\n\n"
-            f"📦 Size: {os.path.getsize(original_path) / 1024 / 1024:.1f} MB\n"
-            f"⏱️ Time: {format_duration(time.monotonic() - download_started)}"
-        )
-
         # ----------------------------------------------------
-        # Split with live FFmpeg progress
+        # Split
         # ----------------------------------------------------
 
         clips_directory = os.path.join(
@@ -2526,52 +2166,49 @@ async def process_original_video(
             "clips"
         )
 
-        split_progress = TelegramProgress(
-            admin_chat_id,
-            title,
-        )
-
-        await split_progress.start(
+        await progress_reporter.edit(
             "✂️ SPLITTING VIDEO\n\n"
             f"🎬 {title}\n\n"
-            "Starting FFmpeg..."
+            "Preparing FFmpeg progress...\n"
+            "⏳ Calculating video duration...",
+            force=True,
         )
 
-        clip_paths = await split_video(
+        clip_paths, source_duration = await split_video(
             original_path,
             clips_directory,
-            progress=split_progress,
+            progress_reporter=progress_reporter,
+            title=title,
         )
 
         print(
             f"FFmpeg created {len(clip_paths)} clips."
         )
 
-        # ----------------------------------------------------
-        # Upload clips to Telegram with live progress
-        # ----------------------------------------------------
-
-        upload_progress = TelegramProgress(
-            admin_chat_id,
-            title,
-        )
-
-        await upload_progress.start(
+        await progress_reporter.edit(
             "📤 UPLOADING CLIPS TO TELEGRAM\n\n"
             f"🎬 {title}\n\n"
-            f"📦 Preparing {len(clip_paths)} clips..."
+            f"{progress_bar(0)} 0.0%\n\n"
+            f"✂️ Total parts: {len(clip_paths)}\n"
+            "📤 Uploaded: 0/" + str(len(clip_paths)),
+            force=True,
         )
 
-        safe_title = safe_filename(title)
+        # ----------------------------------------------------
+        # Upload clips
+        # ----------------------------------------------------
+
+        safe_title = safe_filename(
+            title
+        )
+
         uploaded_messages = []
-        total_clips = len(clip_paths)
-        upload_started = time.monotonic()
-        upload_last_update = [0.0]
 
         for index, clip_path in enumerate(
             clip_paths,
             start=1
         ):
+
             filename = (
                 f"{safe_title} "
                 f"Part {index}.mp4"
@@ -2582,6 +2219,7 @@ async def process_original_video(
                 filename
             )
 
+            # Rename temporary FFmpeg output.
             os.rename(
                 clip_path,
                 final_path
@@ -2590,123 +2228,87 @@ async def process_original_video(
             caption = (
                 f"{CLIP_MARKER}\n"
                 f"Title: {title}\n"
-                f"Part: {index}/{total_clips}"
+                f"Part: {index}/{len(clip_paths)}"
             )
 
-            print(f"Uploading {filename} with 512 KiB chunks...")
+            print(f"Uploading {filename}...")
 
-            clip_upload_started = time.monotonic()
+            clip_size = os.path.getsize(final_path)
+            upload_started = time.monotonic()
 
-            async def update_clip_upload_progress(current, total, clip_no=index):
-                if not total:
-                    return
-
-                percent = (current / total) * 100.0
-                elapsed = time.monotonic() - clip_upload_started
-                speed = current / elapsed if elapsed > 0 else 0
-                remaining = (total - current) / speed if speed > 0 else None
-
+            def upload_progress(current, total):
+                total_bytes = total or clip_size
+                percent = (current / total_bytes) * 100.0 if total_bytes else 0.0
+                elapsed = max(0.01, time.monotonic() - upload_started)
+                speed = current / elapsed
+                remaining_bytes = max(0, total_bytes - current)
+                eta = remaining_bytes / speed if speed > 0 else 0
+                completed_parts = len(uploaded_messages)
                 overall_percent = (
-                    ((clip_no - 1) + (percent / 100.0))
-                    / total_clips
-                    * 100.0
-                )
-
-                await upload_progress.update(
+                    (completed_parts + (percent / 100.0)) / len(clip_paths)
+                ) * 100.0
+                progress_reporter.schedule(
                     "📤 UPLOADING CLIPS TO TELEGRAM\n\n"
                     f"🎬 {title}\n\n"
-                    f"Overall: {make_progress_bar(overall_percent)} "
-                    f"{overall_percent:5.1f}%\n\n"
-                    f"📦 Clip: {clip_no}/{total_clips}\n"
-                    f"{make_progress_bar(percent)} {percent:5.1f}%\n\n"
-                    f"⏱️ Elapsed: {format_duration(elapsed)}\n"
-                    f"⏳ Clip remaining: {format_duration(remaining)}\n"
-                    f"🚀 Speed: {speed / 1024 / 1024:.2f} MB/s"
+                    f"{progress_bar(overall_percent)} {overall_percent:5.1f}%\n\n"
+                    f"📦 Part {index}/{len(clip_paths)}\n"
+                    f"{progress_bar(percent, 16)} {percent:5.1f}%\n"
+                    f"💾 {current / 1024 / 1024:.1f} / {total_bytes / 1024 / 1024:.1f} MB\n"
+                    f"⚡ {speed / 1024 / 1024:.2f} MB/s\n"
+                    f"⏳ Part ETA: ~{format_duration(eta)}\n"
+                    f"✅ Completed: {completed_parts}/{len(clip_paths)}"
                 )
 
-            def upload_callback(current, total, clip_no=index):
-                now = time.monotonic()
-                if total and (
-                    now - upload_last_update[0] >= 2.0
-                    or current >= total
-                ):
-                    upload_last_update[0] = now
-                    asyncio.create_task(
-                        update_clip_upload_progress(current, total, clip_no)
-                    )
-
-            # ------------------------------------------------
-            # Upload with an explicit 512 KiB Telegram chunk size.
-            #
-            # Telethon's send_file() does not expose part_size_kb
-            # directly. Upload the file first with upload_file(),
-            # then send the already-uploaded handle to the channel.
-            # ------------------------------------------------
-
-            clip_file_size = os.path.getsize(final_path)
-
-            uploaded_file = await telethon_client.upload_file(
+            uploaded_message = await telethon_client.send_file(
+                storage_channel,
                 final_path,
-                part_size_kb=512,
-                file_size=clip_file_size,
-                file_name=filename,
-                progress_callback=upload_callback,
+                caption=caption,
+                force_document=False,
+                supports_streaming=True,
+                progress_callback=upload_progress,
             )
 
-            # Preserve the MP4 filename so Telegram can recognize the
-            # uploaded handle correctly when send_file() creates the
-            # final video message.
-            try:
-                uploaded_file.name = filename
-            except Exception:
-                pass
-
-            uploaded_message = (
-                await telethon_client.send_file(
-                    storage_channel,
-                    uploaded_file,
-                    caption=caption,
-                    force_document=False,
-                    supports_streaming=True,
-                )
-            )
-
+            # send_file can return a single Message
+            # or a list depending on the input.
             if isinstance(
                 uploaded_message,
                 list
             ):
+
                 if not uploaded_message:
                     raise RuntimeError(
                         f"Upload returned no message "
                         f"for Part {index}."
                     )
-                uploaded_message = uploaded_message[0]
 
-            uploaded_messages.append(
-                uploaded_message
-            )
+                uploaded_message = (
+                    uploaded_message[0]
+                )
 
-            overall_done = index / total_clips * 100.0
-            await upload_progress.update(
+            uploaded_messages.append(uploaded_message)
+
+            completed_percent = (len(uploaded_messages) / len(clip_paths)) * 100.0
+            await progress_reporter.edit(
                 "📤 UPLOADING CLIPS TO TELEGRAM\n\n"
                 f"🎬 {title}\n\n"
-                f"{make_progress_bar(overall_done)} {overall_done:5.1f}%\n\n"
-                f"📦 Uploaded: {index}/{total_clips}\n"
-                f"⏱️ Total upload time: "
-                f"{format_duration(time.monotonic() - upload_started)}",
+                f"{progress_bar(completed_percent)} {completed_percent:5.1f}%\n\n"
+                f"📦 Uploaded: {len(uploaded_messages)}/{len(clip_paths)}\n"
+                f"✅ Part {index} completed",
                 force=True,
             )
 
             print(
-                f"Uploaded Part {index}: "
-                f"Telegram message ID {uploaded_message.id}"
+                f"Uploaded Part {index}: Telegram message ID {uploaded_message.id}"
             )
 
         # ----------------------------------------------------
-        # Safety check
+        # SAFETY CHECK
         # ----------------------------------------------------
 
-        if len(uploaded_messages) != len(clip_paths):
+        if len(uploaded_messages) != len(
+            clip_paths
+        ):
+
             raise RuntimeError(
                 "Not all clips were uploaded. "
                 "Original will NOT be deleted."
@@ -2726,73 +2328,95 @@ async def process_original_video(
         )
 
         print(
-            f"Queue created: {queue['queue_id']}"
+            f"Queue created: "
+            f"{queue['queue_id']}"
         )
 
         print(
-            f"Manifest message ID: {manifest_message.id}"
+            f"Manifest message ID: "
+            f"{manifest_message.id}"
         )
 
         # ----------------------------------------------------
-        # Only now delete original
+        # ONLY NOW delete original
         # ----------------------------------------------------
 
-        print("All clips successfully uploaded.")
-        print("Deleting original video...")
+        print(
+            "All clips successfully uploaded."
+        )
+
+        print(
+            "Deleting original video..."
+        )
 
         await telethon_client.delete_messages(
             storage_channel,
             video_message_id
         )
 
-        print("Original video deleted.")
+        print(
+            "Original video deleted."
+        )
+
+        # ----------------------------------------------------
+        # Cleanup state
+        # ----------------------------------------------------
 
         await delete_title_request()
         await delete_processing_state()
 
-        await bot_application.bot.send_message(
-            chat_id=admin_chat_id,
-            text=(
-                "✅ VIDEO PROCESSING COMPLETE!\n\n"
-                f"🎬 {title}\n\n"
-                f"✂️ Parts created: {len(uploaded_messages)}\n"
-                "📤 All parts uploaded to Telegram\n"
-                "🗑️ Original video deleted\n\n"
-                "📋 Instagram queue created.\n\n"
-                "⏳ Waiting for the Instagram automation to "
-                "publish the clips."
-            )
+        # ----------------------------------------------------
+        # Notify user
+        # ----------------------------------------------------
+
+        await progress_reporter.edit(
+            "✅ VIDEO PROCESSING COMPLETE!\n\n"
+            f"🎬 {title}\n\n"
+            f"✂️ Parts created: {len(uploaded_messages)}\n"
+            "📤 All parts uploaded to Telegram\n"
+            "🗑️ Original video deleted\n\n"
+            "📋 Instagram queue created.\n"
+            "⏳ Waiting for automatic Instagram publishing.",
+            force=True,
         )
 
     except Exception as e:
-        print("❌ VIDEO PROCESSING FAILED")
-        print(f"{type(e).__name__}: {str(e)}")
 
-        # IMPORTANT: The original is deliberately NOT deleted on failure.
-        try:
-            await bot_application.bot.send_message(
-                chat_id=admin_chat_id,
-                text=(
-                    "❌ VIDEO PROCESSING FAILED\n\n"
-                    f"🎬 {title}\n\n"
-                    f"Error: {type(e).__name__}\n"
-                    f"{str(e)}\n\n"
-                    "⚠️ The original video was NOT deleted.\n"
-                    "Your video is still safe in Cartoon Clip Storage."
-                )
+        print(
+            "❌ VIDEO PROCESSING FAILED"
+        )
+
+        print(
+            f"{type(e).__name__}: {str(e)}"
+        )
+
+        # IMPORTANT:
+        # We deliberately DO NOT delete the original.
+        # It remains available for recovery.
+
+        await bot_application.bot.send_message(
+            chat_id=admin_chat_id,
+            text=(
+                "❌ VIDEO PROCESSING FAILED\n\n"
+                f"🎬 {title}\n\n"
+                f"Error: {type(e).__name__}\n"
+                f"{str(e)}\n\n"
+                "⚠️ The original video was NOT deleted.\n"
+                "Your video is still safe in "
+                "Cartoon Clip Storage."
             )
-        except Exception as notify_error:
-            print(
-                "⚠️ Could not send failure notification: "
-                f"{type(notify_error).__name__}: {str(notify_error)}"
-            )
+        )
 
     finally:
+
+        # Delete temporary Render files.
         try:
+
             shutil.rmtree(
                 temp_directory,
                 ignore_errors=True
             )
+
         except Exception:
             pass
 
