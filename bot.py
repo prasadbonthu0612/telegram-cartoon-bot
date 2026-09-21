@@ -47,7 +47,13 @@ INSTAGRAM_API_BASE = f"https://graph.instagram.com/{INSTAGRAM_API_VERSION}"
 # Minimum time between successful Instagram Reel publications.
 # Default: 1 hour (3600 seconds).
 INSTAGRAM_POST_INTERVAL_SECONDS = int(
-    os.getenv("INSTAGRAM_POST_INTERVAL_SECONDS", "60")
+    os.getenv("INSTAGRAM_POST_INTERVAL_SECONDS", "3600")
+)
+
+# Send a reminder in the private Telegram storage channel when the bot is idle.
+# Default: every 30 minutes (1800 seconds).
+UPLOAD_REMINDER_INTERVAL_SECONDS = int(
+    os.getenv("UPLOAD_REMINDER_INTERVAL_SECONDS", "1800")
 )
 
 # Public URL used by Instagram to fetch temporary Reel videos.
@@ -68,6 +74,7 @@ TITLE_REQUEST_MARKER = "[TITLE_REQUEST]"
 PROCESSING_MARKER = "[PROCESSING]"
 
 CLIP_MARKER = "[CLIP]"
+UPLOAD_REMINDER_MARKER = "[UPLOAD_REMINDER]"
 
 
 # ============================================================
@@ -565,9 +572,10 @@ def publish_reel_from_file(file_path, title, part_index, total_parts):
     try:
         token, public_url = register_public_media(file_path)
 
-        caption = (
-            f"{title}\n\n"
-            f"Part {part_index}/{total_parts}"
+        caption = build_instagram_caption(
+            title,
+            part_index,
+            total_parts
         )
 
         print(
@@ -1025,6 +1033,91 @@ def safe_filename(text):
         text = "Video"
 
     return text[:150]
+
+
+# ============================================================
+# INSTAGRAM HASHTAGS / CAPTION
+# ============================================================
+
+KNOWN_TITLE_TAGS = {
+    "doraemon": "#doraemon",
+    "shinchan": "#shinchan",
+    "crayon shinchan": "#crayonshinchan",
+    "naruto": "#naruto",
+    "one piece": "#onepiece",
+    "onepiece": "#onepiece",
+    "solo leveling": "#sololeveling",
+    "sololeveling": "#sololeveling",
+    "chainsaw man": "#chainsawman",
+    "chainsawman": "#chainsawman",
+    "jujutsu kaisen": "#jujutsukaisen",
+    "demon slayer": "#demonslayer",
+    "dragon ball": "#dragonball",
+    "dragonball": "#dragonball",
+    "attack on titan": "#attackontitan",
+    "pokemon": "#pokemon",
+    "pokemon": "#pokemon",
+}
+
+ANIME_KEYWORDS = {
+    "anime", "naruto", "one piece", "onepiece", "solo leveling",
+    "sololeveling", "chainsaw man", "chainsawman", "jujutsu",
+    "demon slayer", "dragon ball", "dragonball", "attack on titan",
+    "pokemon", "bleach", "black clover", "my hero academia",
+}
+
+
+def build_instagram_hashtags(title):
+    """
+    Build a small set of relevant hashtags from the title.
+    This does NOT claim that hashtags guarantee trending; it keeps tags
+    related to the actual cartoon/anime title instead of unrelated spam.
+    """
+    lowered = title.lower()
+
+    tags = []
+
+    if any(keyword in lowered for keyword in ANIME_KEYWORDS):
+        tags.extend(["#anime", "#animeclips", "#animefans"])
+    else:
+        tags.extend(["#cartoon", "#cartoonclips", "#animation"])
+
+    for phrase, tag in KNOWN_TITLE_TAGS.items():
+        if phrase in lowered and tag not in tags:
+            tags.append(tag)
+
+    # Add a clean hashtag from the title itself when possible.
+    words = re.findall(r"[A-Za-z0-9]+", title)
+    ignored = {
+        "episode", "ep", "part", "clip", "video", "season",
+        "the", "and", "of", "a", "an"
+    }
+    meaningful = [w.lower() for w in words if w.lower() not in ignored and not w.isdigit()]
+
+    if meaningful:
+        title_tag = "#" + "".join(meaningful)
+        if len(title_tag) <= 60 and title_tag not in tags:
+            tags.append(title_tag)
+
+    # Broad discovery tag, while keeping the total small and relevant.
+    tags.append("#reels")
+
+    # Remove duplicates while preserving order.
+    unique_tags = []
+    for tag in tags:
+        if tag not in unique_tags:
+            unique_tags.append(tag)
+
+    return " ".join(unique_tags[:8])
+
+
+def build_instagram_caption(title, part_index, total_parts):
+    hashtags = build_instagram_hashtags(title)
+    return (
+        f"{title}\n\n"
+        f"Part {part_index}/{total_parts}\n\n"
+        f"{hashtags}"
+    )
 
 
 # ============================================================
@@ -1673,6 +1766,110 @@ async def process_pending_queues():
         )
 
 
+async def get_last_upload_reminder_time():
+    """Return the timestamp of the newest upload reminder in the storage channel."""
+    storage_channel = await find_storage_channel()
+    if storage_channel is None:
+        return None
+
+    messages = await telethon_client.get_messages(
+        storage_channel,
+        limit=200
+    )
+
+    for message in messages:
+        text = message.message or ""
+        if not text.startswith(UPLOAD_REMINDER_MARKER):
+            continue
+
+        try:
+            payload = json.loads(text.split("\n", 1)[1])
+            value = payload.get("sent_at")
+            if not value:
+                continue
+
+            timestamp = datetime.fromisoformat(
+                value.replace("Z", "+00:00")
+            )
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            return timestamp
+        except Exception:
+            continue
+
+    return None
+
+
+async def storage_channel_is_idle(manifests):
+    """True when there is no video waiting for a title/processing or Instagram publishing."""
+    if await load_title_request():
+        return False
+
+    # Check the persistent processing marker.
+    storage_channel = await find_storage_channel()
+    if storage_channel is None:
+        return False
+
+    messages = await telethon_client.get_messages(
+        storage_channel,
+        limit=200
+    )
+
+    for message in messages:
+        text = message.message or ""
+        if text.startswith(PROCESSING_MARKER):
+            return False
+
+    for item in manifests:
+        queue = item.get("queue", {})
+        if queue.get("status") == "COMPLETED":
+            continue
+
+        for clip in queue.get("clips", []):
+            if clip.get("instagram_status") != "PUBLISHED":
+                return False
+
+    return True
+
+
+async def maybe_send_upload_reminder(manifests):
+    """Send an upload prompt to the private storage channel every 30 minutes while idle."""
+    if not await storage_channel_is_idle(manifests):
+        return
+
+    storage_channel = await find_storage_channel()
+    if storage_channel is None:
+        return
+
+    now = datetime.now(timezone.utc)
+    last_reminder = await get_last_upload_reminder_time()
+
+    if last_reminder is not None:
+        elapsed = (now - last_reminder).total_seconds()
+        if elapsed < UPLOAD_REMINDER_INTERVAL_SECONDS:
+            return
+
+    payload = {
+        "sent_at": now.isoformat()
+    }
+
+    text = (
+        f"{UPLOAD_REMINDER_MARKER}\n"
+        f"{json.dumps(payload)}\n\n"
+        "📥 READY FOR THE NEXT VIDEO\n\n"
+        "Upload the ORIGINAL video to this channel.\n"
+        "Then reply to the bot with the title.\n\n"
+        "🎬 After that, everything is automatic."
+    )
+
+    await telethon_client.send_message(
+        storage_channel,
+        text
+    )
+
+    print("📥 Upload reminder sent to the storage channel.")
+
+
 async def instagram_queue_loop():
     """
     Background loop for the Instagram queue.
@@ -1684,7 +1881,11 @@ async def instagram_queue_loop():
 
     while True:
         try:
+            manifests = await find_queue_manifests()
             await process_pending_queues()
+            # If nothing is waiting to publish, remind the user in the
+            # private storage channel every 30 minutes to upload the next video.
+            await maybe_send_upload_reminder(manifests)
         except Exception as e:
             print(
                 "❌ Instagram queue loop error:\n"
@@ -2585,6 +2786,11 @@ def main():
         "Instagram posting interval: "
         f"{INSTAGRAM_POST_INTERVAL_SECONDS} seconds "
         "(default 1 hour)."
+    )
+    print(
+        "Upload reminder interval: "
+        f"{UPLOAD_REMINDER_INTERVAL_SECONDS} seconds "
+        "(default 30 minutes)."
     )
 
     bot_application.run_polling(
