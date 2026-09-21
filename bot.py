@@ -2157,28 +2157,26 @@ async def process_original_video(
 
         print("Downloading original...")
 
-        # Use Telethon's low-level downloader with the maximum supported
-        # chunk size (512 KiB). Telethon's download_file API expects
-        # part_size_kb, not request_size.
-        downloaded_path = (
-            await telethon_client.download_file(
-                original_message.media,
-                file=original_path,
-                part_size_kb=512,
-                file_size=(
-                    getattr(
-                        getattr(original_message, "file", None),
-                        "size",
-                        None,
-                    )
-                ),
-                progress_callback=download_callback,
-            )
+        # Use Telethon's high-level media downloader. This is the
+        # recommended API for Message media and works correctly with
+        # Telegram video/document messages. cryptg (in requirements.txt)
+        # handles Telegram encryption/decryption in C for better speed.
+        downloaded_path = await telethon_client.download_media(
+            original_message,
+            file=original_path,
+            progress_callback=download_callback,
         )
 
-        if not downloaded_path:
+        # download_media returns the saved path on success. Also verify
+        # the file exists and is non-empty before continuing.
+        if not downloaded_path or not os.path.isfile(original_path):
             raise RuntimeError(
                 "Failed to download original video."
+            )
+
+        if os.path.getsize(original_path) <= 0:
+            raise RuntimeError(
+                "Downloaded original video is empty."
             )
 
         await download_progress.finish(
