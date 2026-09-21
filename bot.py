@@ -1404,7 +1404,19 @@ async def download_original_when_ready(message_id, output_path, progress_callbac
             expected_size = getattr(getattr(current_message, "file", None), "size", None)
 
             try:
+                # If a previous attempt already wrote the complete file, keep it.
+                # Telethon can raise at the very end of a transfer even though
+                # all expected bytes are already on disk.
                 if os.path.exists(output_path):
+                    existing_size = os.path.getsize(output_path)
+                    if expected_size is None or existing_size >= expected_size:
+                        print(
+                            f"✅ Original video is already complete: "
+                            f"{existing_size} bytes."
+                        )
+                        return output_path
+
+                    # Only remove a genuinely incomplete previous attempt.
                     os.remove(output_path)
 
                 downloaded = await fast_download_telegram_media(
@@ -1413,13 +1425,22 @@ async def download_original_when_ready(message_id, output_path, progress_callbac
                     progress_callback=progress_callback,
                 )
 
-                if downloaded and os.path.exists(output_path):
+                if os.path.exists(output_path):
                     actual_size = os.path.getsize(output_path)
+
+                    # Treat the local file as successful when it contains the
+                    # complete Telegram media, even if Telethon returned a
+                    # falsy value or raised immediately after the final write.
                     if expected_size is None or actual_size >= expected_size:
-                        return downloaded
+                        print(
+                            f"✅ Original video download complete: "
+                            f"{actual_size} bytes."
+                        )
+                        return output_path
 
                     last_error = RuntimeError(
-                        f"Telegram returned an incomplete video ({actual_size} / {expected_size} bytes)."
+                        f"Telegram returned an incomplete video "
+                        f"({actual_size} / {expected_size} bytes)."
                     )
                 else:
                     last_error = RuntimeError(
@@ -1427,6 +1448,17 @@ async def download_original_when_ready(message_id, output_path, progress_callbac
                     )
 
             except Exception as exc:
+                # IMPORTANT: Do not throw away a complete file merely because
+                # Telethon raised after the final bytes were written.
+                if os.path.exists(output_path):
+                    actual_size = os.path.getsize(output_path)
+                    if expected_size is None or actual_size >= expected_size:
+                        print(
+                            f"✅ Download reached the expected size despite "
+                            f"a final Telethon exception: {actual_size} bytes."
+                        )
+                        return output_path
+
                 last_error = exc
 
         if attempt < 12:
