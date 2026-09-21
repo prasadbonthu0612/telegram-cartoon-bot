@@ -1378,6 +1378,74 @@ async def fast_download_telegram_media(message, output_path, progress_callback=N
     return downloaded
 
 
+async def download_original_when_ready(message_id, output_path, progress_callback=None):
+    """
+    Download an original video only after Telegram has made the media
+    completely available. A NewMessage event can arrive while a large
+    client upload is still being finalized, so retry the exact same fast
+    download instead of failing the whole job at the end of a partial
+    transfer.
+
+    This does not change the transfer chunk size or the splitter.
+    """
+    last_error = None
+
+    for attempt in range(1, 13):
+        current_message = await telethon_client.get_messages(
+            await find_storage_channel(),
+            ids=message_id,
+        )
+
+        if not current_message or not current_message.video:
+            last_error = RuntimeError(
+                "Original video is not currently available on Telegram."
+            )
+        else:
+            expected_size = getattr(getattr(current_message, "file", None), "size", None)
+
+            try:
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+
+                downloaded = await fast_download_telegram_media(
+                    current_message,
+                    output_path,
+                    progress_callback=progress_callback,
+                )
+
+                if downloaded and os.path.exists(output_path):
+                    actual_size = os.path.getsize(output_path)
+                    if expected_size is None or actual_size >= expected_size:
+                        return downloaded
+
+                    last_error = RuntimeError(
+                        f"Telegram returned an incomplete video ({actual_size} / {expected_size} bytes)."
+                    )
+                else:
+                    last_error = RuntimeError(
+                        "Telegram download returned no completed file."
+                    )
+
+            except Exception as exc:
+                last_error = exc
+
+        if attempt < 12:
+            print(
+                f"⏳ Original video is not ready yet (attempt {attempt}/12). "
+                "Waiting 5 seconds before retrying..."
+            )
+            await asyncio.sleep(5)
+
+    if last_error:
+        raise RuntimeError(
+            f"Failed to download original video after waiting for Telegram upload completion: {last_error}"
+        )
+
+    raise RuntimeError(
+        "Failed to download original video after waiting for Telegram upload completion."
+    )
+
+
 # ============================================================
 # CREATE QUEUE MANIFEST
 # ============================================================
@@ -2174,8 +2242,8 @@ async def process_original_video(
                 f"⏳ ETA: ~{format_duration(eta)}"
             )
 
-        downloaded_path = await fast_download_telegram_media(
-            original_message,
+        downloaded_path = await download_original_when_ready(
+            video_message_id,
             original_path,
             progress_callback=download_progress,
         )
