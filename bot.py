@@ -1240,138 +1240,92 @@ async def split_video(
     progress_reporter=None,
     title="Video",
 ):
-    """Split the source into ~60s MP4 clips while reporting live FFmpeg progress."""
+    """Fast keyframe-aware stream-copy splitter targeting ~60-second clips."""
     os.makedirs(output_directory, exist_ok=True)
 
-    output_pattern = os.path.join(
-        output_directory,
-        "part_%03d.mp4"
+    # Get keyframe timestamps. No video is decoded/re-encoded.
+    command = [
+        "ffprobe", "-v", "error",
+        "-skip_frame", "nokey",
+        "-select_streams", "v:0",
+        "-show_entries", "frame=best_effort_timestamp_time",
+        "-of", "csv=p=0",
+        input_path,
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
+    stdout, stderr = await process.communicate()
+    if process.returncode != 0:
+        raise RuntimeError(f"Could not read video keyframes.\n{stderr.decode(errors='replace').strip()}")
+
+    keyframes = []
+    for line in stdout.decode(errors="replace").splitlines():
+        try:
+            value = float(line.strip())
+            if value >= 0:
+                keyframes.append(value)
+        except ValueError:
+            continue
 
     duration = await get_video_duration(input_path)
-    expected_parts = max(1, math.ceil(duration / 60.0))
-    started = time.monotonic()
-    last_report = 0.0
+    if not keyframes:
+        raise RuntimeError("No video keyframes were found.")
 
+    # Pick boundaries between 55 and 65 seconds, preferring 60 seconds.
+    boundaries = []
+    current = 0.0
+    while duration - current > 60.0:
+        candidates = [k for k in keyframes if current + 55.0 <= k <= current + 65.0]
+        if not candidates:
+            raise RuntimeError(
+                f"No safe keyframe found between {current + 55:.1f}s and {current + 65:.1f}s. "
+                "Cannot create a safe <=65 second stream-copy clip."
+            )
+        boundary = min(candidates, key=lambda k: abs(k - (current + 60.0)))
+        boundaries.append(boundary)
+        current = boundary
+
+    output_pattern = os.path.join(output_directory, "part_%03d.mp4")
     command = [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-loglevel", "error",
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-i", input_path,
-
-        "-map", "0:v:0",
-        "-map", "0:a:0?",
-
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "23",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-movflags", "+faststart",
-
+        "-map", "0:v:0", "-map", "0:a:0?",
+        "-c", "copy",
         "-f", "segment",
-        "-segment_time", "60",
+        "-segment_times", ",".join(f"{x:.3f}" for x in boundaries),
         "-reset_timestamps", "1",
         "-segment_format", "mp4",
-
-        # Machine-readable progress for the Telegram progress display.
-        "-progress", "pipe:1",
-        "-nostats",
-
         output_pattern,
     ]
-
-    print("Running FFmpeg:")
+    print("Running FAST stream-copy FFmpeg:")
     print(" ".join(command))
 
     process = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+        *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
-
-    current_seconds = 0.0
-
-    while True:
-        line = await process.stdout.readline()
-        if not line:
-            break
-
-        line = line.decode(errors="replace").strip()
-
-        if line.startswith("out_time_ms="):
-            try:
-                # FFmpeg reports out_time_ms in microseconds.
-                current_seconds = max(
-                    0.0,
-                    int(line.split("=", 1)[1]) / 1_000_000.0
-                )
-            except ValueError:
-                continue
-
-            percent = min(100.0, (current_seconds / duration) * 100.0)
-            elapsed = max(0.01, time.monotonic() - started)
-            eta = (
-                elapsed * (100.0 - percent) / percent
-                if percent > 0.5
-                else 0
-            )
-
-            # Count clips already materialized by FFmpeg.
-            created = len([
-                name for name in os.listdir(output_directory)
-                if name.startswith("part_") and name.endswith(".mp4")
-            ])
-
-            now = time.monotonic()
-            if progress_reporter and (
-                now - last_report >= 2.0 or percent >= 100.0
-            ):
-                last_report = now
-                await progress_reporter.edit(
-                    "✂️ SPLITTING VIDEO\n\n"
-                    f"🎬 {title}\n\n"
-                    f"{progress_bar(percent)} {percent:5.1f}%\n\n"
-                    f"⏱️ Elapsed: {format_duration(elapsed)}\n"
-                    f"⏳ ETA: ~{format_duration(eta)}\n\n"
-                    f"📹 Duration: {format_duration(duration)}\n"
-                    f"✂️ Parts created: {created}/{expected_parts}"
-                )
-
-    stderr = await process.stderr.read()
-    return_code = await process.wait()
-
-    if return_code != 0:
+    stdout, stderr = await process.communicate()
+    if process.returncode != 0:
         error_text = stderr.decode(errors="replace").strip()
-        print("FFmpeg ERROR:")
-        print(error_text)
-        raise RuntimeError(
-            "FFmpeg failed to split the video.\n"
-            f"{error_text[-2000:]}"
-        )
+        raise RuntimeError(f"FFmpeg failed to split the video.\n{error_text[-2000:]}")
 
-    clips = []
-    for filename in os.listdir(output_directory):
-        if filename.endswith(".mp4") and filename.startswith("part_"):
-            clips.append(os.path.join(output_directory, filename))
-
-    clips.sort()
-
+    clips = sorted(
+        os.path.join(output_directory, name)
+        for name in os.listdir(output_directory)
+        if name.startswith("part_") and name.endswith(".mp4")
+    )
     if not clips:
         raise RuntimeError("FFmpeg completed but produced no clips.")
 
-    elapsed = time.monotonic() - started
     if progress_reporter:
         await progress_reporter.edit(
-            "✂️ SPLITTING COMPLETE\n\n"
+            "✂️ FAST SPLITTING COMPLETE\n\n"
             f"🎬 {title}\n\n"
-            f"{progress_bar(100)} 100.0%\n\n"
-            f"⏱️ Time taken: {format_duration(elapsed)}\n"
-            f"✂️ Parts created: {len(clips)}/{expected_parts}",
+            f"📹 Duration: {format_duration(duration)}\n"
+            f"✂️ Parts created: {len(clips)}\n"
+            "⚡ Stream copy: no re-encoding",
             force=True,
         )
-
     return clips, duration
 
 
@@ -1399,6 +1353,7 @@ async def create_automatic_queue(
         "title": title,
         "created_at": now,
         "status": "PENDING",
+        "processing_complete": False,
         "original_telegram_message_id":
             original_message_id,
         "total_clips":
@@ -1461,6 +1416,22 @@ async def create_automatic_queue(
     )
 
     return queue, manifest_message
+
+async def append_clip_to_queue(manifest_message, queue, message, title, index):
+    """Append one newly uploaded clip to a live persistent queue."""
+    queue["clips"].append({
+        "index": index,
+        "telegram_message_id": message.id,
+        "filename": f"{safe_filename(title)} Part {index}.mp4",
+        "status": "PENDING",
+        "instagram_status": "NOT_POSTED",
+        "instagram_media_id": None,
+        "posted_at": None,
+        "deleted_from_telegram": False,
+    })
+    queue["total_clips"] = len(queue["clips"])
+    await save_queue_manifest(manifest_message, queue)
+
 
 # ============================================================
 # INSTAGRAM QUEUE PUBLISHER
@@ -1774,6 +1745,12 @@ async def process_pending_queues():
 
             clips = queue.get("clips", [])
 
+            # A live queue is still being generated by the splitter. Never
+            # mark it complete just because all currently-uploaded clips are
+            # published.
+            if not queue.get("processing_complete", False) and not clips:
+                continue
+
             # Find the first clip that has not been successfully
             # published yet.
             target_clip = None
@@ -1786,6 +1763,8 @@ async def process_pending_queues():
                 break
 
             if target_clip is None:
+                if not queue.get("processing_complete", False):
+                    return
                 queue["status"] = "COMPLETED"
                 queue["next_clip_index"] = (
                     queue.get("total_clips", len(clips)) + 1
@@ -2158,81 +2137,51 @@ async def process_original_video(
             )
 
         # ----------------------------------------------------
-        # Split
+        # FAST STREAM-COPY SPLIT + IMMEDIATE TELEGRAM UPLOAD
         # ----------------------------------------------------
-
-        clips_directory = os.path.join(
-            temp_directory,
-            "clips"
-        )
+        clips_directory = os.path.join(temp_directory, "clips")
+        os.makedirs(clips_directory, exist_ok=True)
 
         await progress_reporter.edit(
-            "✂️ SPLITTING VIDEO\n\n"
+            "✂️ FAST SPLITTING + UPLOADING\n\n"
             f"🎬 {title}\n\n"
-            "Preparing FFmpeg progress...\n"
-            "⏳ Calculating video duration...",
+            "⚡ Stream copy (no re-encoding)\n"
+            "📤 Each clip will be uploaded as soon as it is ready.",
             force=True,
         )
 
-        clip_paths, source_duration = await split_video(
-            original_path,
-            clips_directory,
-            progress_reporter=progress_reporter,
-            title=title,
+        # Create the persistent queue BEFORE the splitter starts producing
+        # clips. This lets Instagram see Part 1 while later parts are still
+        # being split/uploaded.
+        queue, manifest_message = await create_automatic_queue(
+            storage_channel,
+            title,
+            video_message_id,
+            [],
         )
-
-        print(
-            f"FFmpeg created {len(clip_paths)} clips."
-        )
-
-        await progress_reporter.edit(
-            "📤 UPLOADING CLIPS TO TELEGRAM\n\n"
-            f"🎬 {title}\n\n"
-            f"{progress_bar(0)} 0.0%\n\n"
-            f"✂️ Total parts: {len(clip_paths)}\n"
-            "📤 Uploaded: 0/" + str(len(clip_paths)),
-            force=True,
-        )
-
-        # ----------------------------------------------------
-        # Upload clips
-        # ----------------------------------------------------
-
-        safe_title = safe_filename(
-            title
-        )
+        queue["processing_complete"] = False
+        queue["total_clips"] = 0
+        queue["clips"] = []
+        await save_queue_manifest(manifest_message, queue)
 
         uploaded_messages = []
+        uploaded_count = 0
+        splitter_done = False
+        seen_files = set()
 
-        for index, clip_path in enumerate(
-            clip_paths,
-            start=1
-        ):
-
-            filename = (
-                f"{safe_title} "
-                f"Part {index}.mp4"
-            )
-
-            final_path = os.path.join(
-                clips_directory,
-                filename
-            )
-
-            # Rename temporary FFmpeg output.
-            os.rename(
-                clip_path,
-                final_path
-            )
+        async def upload_ready_clip(clip_path):
+            nonlocal uploaded_count
+            index = uploaded_count + 1
+            filename = f"{safe_filename(title)} Part {index}.mp4"
+            final_path = os.path.join(clips_directory, filename)
+            if os.path.abspath(clip_path) != os.path.abspath(final_path):
+                os.replace(clip_path, final_path)
 
             caption = (
                 f"{CLIP_MARKER}\n"
                 f"Title: {title}\n"
-                f"Part: {index}/{len(clip_paths)}"
+                f"Part: {index}"
             )
-
-            print(f"Uploading {filename}...")
-
             clip_size = os.path.getsize(final_path)
             upload_started = time.monotonic()
 
@@ -2243,20 +2192,14 @@ async def process_original_video(
                 speed = current / elapsed
                 remaining_bytes = max(0, total_bytes - current)
                 eta = remaining_bytes / speed if speed > 0 else 0
-                completed_parts = len(uploaded_messages)
-                overall_percent = (
-                    (completed_parts + (percent / 100.0)) / len(clip_paths)
-                ) * 100.0
                 progress_reporter.schedule(
-                    "📤 UPLOADING CLIPS TO TELEGRAM\n\n"
+                    "📤 UPLOADING READY CLIP\n\n"
                     f"🎬 {title}\n\n"
-                    f"{progress_bar(overall_percent)} {overall_percent:5.1f}%\n\n"
-                    f"📦 Part {index}/{len(clip_paths)}\n"
+                    f"📦 Part {index}\n"
                     f"{progress_bar(percent, 16)} {percent:5.1f}%\n"
                     f"💾 {current / 1024 / 1024:.1f} / {total_bytes / 1024 / 1024:.1f} MB\n"
                     f"⚡ {speed / 1024 / 1024:.2f} MB/s\n"
-                    f"⏳ Part ETA: ~{format_duration(eta)}\n"
-                    f"✅ Completed: {completed_parts}/{len(clip_paths)}"
+                    f"⏳ ETA: ~{format_duration(eta)}"
                 )
 
             uploaded_message = await telethon_client.send_file(
@@ -2267,75 +2210,150 @@ async def process_original_video(
                 supports_streaming=True,
                 progress_callback=upload_progress,
             )
-
-            # send_file can return a single Message
-            # or a list depending on the input.
-            if isinstance(
-                uploaded_message,
-                list
-            ):
-
+            if isinstance(uploaded_message, list):
                 if not uploaded_message:
-                    raise RuntimeError(
-                        f"Upload returned no message "
-                        f"for Part {index}."
-                    )
-
-                uploaded_message = (
-                    uploaded_message[0]
-                )
+                    raise RuntimeError(f"Upload returned no message for Part {index}.")
+                uploaded_message = uploaded_message[0]
 
             uploaded_messages.append(uploaded_message)
+            uploaded_count += 1
+            await append_clip_to_queue(
+                manifest_message, queue, uploaded_message, title, index
+            )
+            print(f"Uploaded Part {index}: Telegram message ID {uploaded_message.id}; added to live queue.")
 
-            completed_percent = (len(uploaded_messages) / len(clip_paths)) * 100.0
-            await progress_reporter.edit(
-                "📤 UPLOADING CLIPS TO TELEGRAM\n\n"
-                f"🎬 {title}\n\n"
-                f"{progress_bar(completed_percent)} {completed_percent:5.1f}%\n\n"
-                f"📦 Uploaded: {len(uploaded_messages)}/{len(clip_paths)}\n"
-                f"✅ Part {index} completed",
-                force=True,
+        # Run FFmpeg segmentation once. While it runs, watch for finalized
+        # segment files and upload them immediately.
+        async def run_stream_splitter():
+            # Find keyframes first so every non-final segment ends at a keyframe
+            # no later than 60 seconds. This preserves the fast -c copy path.
+            probe = [
+                "ffprobe", "-v", "error", "-skip_frame", "nokey",
+                "-select_streams", "v:0",
+                "-show_entries", "frame=best_effort_timestamp_time",
+                "-of", "csv=p=0", original_path,
+            ]
+            probe_proc = await asyncio.create_subprocess_exec(
+                *probe, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            probe_out, probe_err = await probe_proc.communicate()
+            if probe_proc.returncode != 0:
+                raise RuntimeError(
+                    "Could not read video keyframes.\n"
+                    + probe_err.decode(errors="replace")[-2000:]
+                )
+
+            keyframes = []
+            for line in probe_out.decode(errors="replace").splitlines():
+                try:
+                    value = float(line.strip())
+                    if value >= 0:
+                        keyframes.append(value)
+                except ValueError:
+                    pass
+            if not keyframes:
+                raise RuntimeError("No video keyframes were found.")
+
+            duration = await get_video_duration(original_path)
+            boundaries = []
+            current = 0.0
+            while duration - current > 60.0:
+                candidates = [
+                    k for k in keyframes
+                    if current + 45.0 <= k <= current + 60.0
+                ]
+                if not candidates:
+                    raise RuntimeError(
+                        f"No safe keyframe between {current + 45:.1f}s and {current + 60:.1f}s. "
+                        "Cannot create a stream-copy clip that stays within 60 seconds."
+                    )
+                boundary = min(candidates, key=lambda k: abs(k - (current + 60.0)))
+                boundaries.append(boundary)
+                current = boundary
+
+            command = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", original_path,
+                "-map", "0:v:0", "-map", "0:a:0?",
+                "-c", "copy",
+                "-f", "segment",
+                "-segment_times", ",".join(f"{x:.3f}" for x in boundaries),
+                "-reset_timestamps", "1",
+                "-segment_format", "mp4",
+                os.path.join(clips_directory, "part_%03d.mp4"),
+            ]
+            print("Running FAST stream-copy FFmpeg:")
+            print(" ".join(command))
+            proc = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            return proc, asyncio.create_task(proc.stderr.read()), duration, boundaries
+
+        process, stderr_task, source_duration, boundaries = await run_stream_splitter()
+        wait_task = asyncio.create_task(process.wait())
+        while not wait_task.done():
+            current_files = sorted(
+                os.path.join(clips_directory, name)
+                for name in os.listdir(clips_directory)
+                if name.startswith("part_") and name.endswith(".mp4")
+            )
+            for clip_path in current_files:
+                if clip_path in seen_files:
+                    continue
+                # FFmpeg may still be closing a segment; wait until its size
+                # is stable before uploading it.
+                size1 = os.path.getsize(clip_path)
+                await asyncio.sleep(0.4)
+                if not os.path.isfile(clip_path):
+                    continue
+                size2 = os.path.getsize(clip_path)
+                if size1 != size2 or size2 == 0:
+                    continue
+                seen_files.add(clip_path)
+                await upload_ready_clip(clip_path)
+
+            await asyncio.sleep(0.5)
+
+        return_code = await wait_task
+        stderr = await stderr_task
+        if return_code != 0:
+            raise RuntimeError(
+                "FFmpeg failed to split the video.\n"
+                + stderr.decode(errors="replace")[-2000:]
             )
 
-            print(
-                f"Uploaded Part {index}: Telegram message ID {uploaded_message.id}"
-            )
+        # Pick up the final segment after FFmpeg closes the file.
+        for clip_path in sorted(
+            os.path.join(clips_directory, name)
+            for name in os.listdir(clips_directory)
+            if name.startswith("part_") and name.endswith(".mp4")
+        ):
+            if clip_path not in seen_files:
+                seen_files.add(clip_path)
+                await upload_ready_clip(clip_path)
+
+        if not uploaded_messages:
+            raise RuntimeError("FFmpeg completed but produced no uploaded clips.")
+
+        # Mark the live queue as fully generated only after FFmpeg and all
+        # Telegram uploads have completed. Instagram can have been publishing
+        # earlier clips throughout the entire process.
+        queue["processing_complete"] = True
+        queue["total_clips"] = len(uploaded_messages)
+        await save_queue_manifest(manifest_message, queue)
+
+        print(f"FAST split/upload complete: {len(uploaded_messages)} clips.")
 
         # ----------------------------------------------------
         # SAFETY CHECK
         # ----------------------------------------------------
+        if not uploaded_messages:
+            raise RuntimeError("No clips were uploaded. Original will NOT be deleted.")
 
-        if len(uploaded_messages) != len(
-            clip_paths
-        ):
-
-            raise RuntimeError(
-                "Not all clips were uploaded. "
-                "Original will NOT be deleted."
-            )
-
-        # ----------------------------------------------------
-        # Create persistent queue
-        # ----------------------------------------------------
-
-        queue, manifest_message = (
-            await create_automatic_queue(
-                storage_channel,
-                title,
-                video_message_id,
-                uploaded_messages
-            )
-        )
-
-        print(
-            f"Queue created: "
-            f"{queue['queue_id']}"
-        )
-
-        print(
-            f"Manifest message ID: "
-            f"{manifest_message.id}"
-        )
+        print(f"Live queue contains {len(uploaded_messages)} uploaded clips.")
+        print(f"Manifest message ID: {manifest_message.id}")
 
         # ----------------------------------------------------
         # ONLY NOW delete original
