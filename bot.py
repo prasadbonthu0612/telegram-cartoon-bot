@@ -2228,19 +2228,32 @@ async def process_original_video(
 
         print("Downloading original...")
 
-        # Use Telethon's high-level media downloader. This is the
-        # recommended API for Message media and works correctly with
-        # Telegram video/document messages. cryptg (in requirements.txt)
-        # handles Telegram encryption/decryption in C for better speed.
-        downloaded_path = await telethon_client.download_media(
-            original_message,
+        # Use Telethon's low-level downloader with the maximum supported
+        # chunk size (512 KiB). This reduces the number of Telegram
+        # transfer requests. cryptg (installed in requirements.txt)
+        # handles MTProto encryption/decryption in C.
+        #
+        # IMPORTANT:
+        # download_file() returns None when writing directly to a file,
+        # so success is checked using the actual file on disk rather than
+        # testing the return value.
+        original_file_size = getattr(
+            getattr(original_message, "file", None),
+            "size",
+            None,
+        )
+
+        downloaded_result = await telethon_client.download_file(
+            original_message.media,
             file=original_path,
+            part_size_kb=512,
+            file_size=original_file_size,
             progress_callback=download_callback,
         )
 
-        # download_media returns the saved path on success. Also verify
-        # the file exists and is non-empty before continuing.
-        if not downloaded_path or not os.path.isfile(original_path):
+        # When a file path is supplied, Telethon writes the data directly
+        # to that path. Verify the actual file exists and is non-empty.
+        if not os.path.isfile(original_path):
             raise RuntimeError(
                 "Failed to download original video."
             )
@@ -2333,7 +2346,7 @@ async def process_original_video(
                 f"Part: {index}/{total_clips}"
             )
 
-            print(f"Uploading {filename}...")
+            print(f"Uploading {filename} with 512 KiB chunks...")
 
             clip_upload_started = time.monotonic()
 
@@ -2375,14 +2388,39 @@ async def process_original_video(
                         update_clip_upload_progress(current, total, clip_no)
                     )
 
+            # ------------------------------------------------
+            # Upload with an explicit 512 KiB Telegram chunk size.
+            #
+            # Telethon's send_file() does not expose part_size_kb
+            # directly. Upload the file first with upload_file(),
+            # then send the already-uploaded handle to the channel.
+            # ------------------------------------------------
+
+            clip_file_size = os.path.getsize(final_path)
+
+            uploaded_file = await telethon_client.upload_file(
+                final_path,
+                part_size_kb=512,
+                file_size=clip_file_size,
+                file_name=filename,
+                progress_callback=upload_callback,
+            )
+
+            # Preserve the MP4 filename so Telegram can recognize the
+            # uploaded handle correctly when send_file() creates the
+            # final video message.
+            try:
+                uploaded_file.name = filename
+            except Exception:
+                pass
+
             uploaded_message = (
                 await telethon_client.send_file(
                     storage_channel,
-                    final_path,
+                    uploaded_file,
                     caption=caption,
                     force_document=False,
                     supports_streaming=True,
-                    progress_callback=upload_callback,
                 )
             )
 
