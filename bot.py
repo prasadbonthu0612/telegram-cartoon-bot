@@ -44,6 +44,12 @@ INSTAGRAM_USER_ID = os.getenv("INSTAGRAM_USER_ID")
 INSTAGRAM_API_VERSION = os.getenv("INSTAGRAM_API_VERSION", "v25.0")
 INSTAGRAM_API_BASE = f"https://graph.instagram.com/{INSTAGRAM_API_VERSION}"
 
+# Minimum time between successful Instagram Reel publications.
+# Default: 1 hour (3600 seconds).
+INSTAGRAM_POST_INTERVAL_SECONDS = int(
+    os.getenv("INSTAGRAM_POST_INTERVAL_SECONDS", "60")
+)
+
 # Public URL used by Instagram to fetch temporary Reel videos.
 # Set this in Render to your public Render URL, for example:
 # https://telegram-cartoon-bot-if57.onrender.com
@@ -1438,13 +1444,48 @@ async def publish_one_queue_clip(
         )
 
 
+async def get_last_successful_instagram_publish_time(manifests):
+    """
+    Find the most recent successful Instagram publication time across
+    all Telegram queue manifests. The timestamp is stored in the queue
+    manifest, so the one-hour cooldown survives Render restarts.
+    """
+    latest = None
+
+    for item in manifests:
+        queue = item.get("queue", {})
+
+        for clip in queue.get("clips", []):
+            if clip.get("instagram_status") != "PUBLISHED":
+                continue
+
+            posted_at = clip.get("posted_at")
+            if not posted_at:
+                continue
+
+            try:
+                timestamp = datetime.fromisoformat(
+                    posted_at.replace("Z", "+00:00")
+                )
+
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+                if latest is None or timestamp > latest:
+                    latest = timestamp
+            except Exception:
+                continue
+
+    return latest
+
+
 async def process_pending_queues():
     """
-    Scan Telegram queue manifests and publish one pending/failed
-    clip at a time.
+    Scan Telegram queue manifests and publish at most ONE clip per
+    configured interval. The default interval is one hour.
 
-    A failed clip remains in Telegram and can be retried on the
-    next scan.
+    A failed clip remains in Telegram and can be retried on a later
+    scan, subject to the same publishing interval.
     """
     if not INSTAGRAM_ACCESS_TOKEN or not INSTAGRAM_USER_ID:
         print(
@@ -1462,6 +1503,30 @@ async def process_pending_queues():
 
     try:
         manifests = await find_queue_manifests()
+
+        # Enforce the posting interval using timestamps persisted in the
+        # Telegram queue manifests. This prevents a Render restart or a
+        # manual /publish_queue command from bypassing the one-hour limit.
+        last_publish = await get_last_successful_instagram_publish_time(
+            manifests
+        )
+
+        if last_publish is not None:
+            now = datetime.now(timezone.utc)
+            elapsed = (now - last_publish).total_seconds()
+
+            if elapsed < INSTAGRAM_POST_INTERVAL_SECONDS:
+                remaining = int(
+                    INSTAGRAM_POST_INTERVAL_SECONDS - elapsed
+                )
+                minutes = remaining // 60
+                seconds = remaining % 60
+
+                print(
+                    "⏳ Instagram posting cooldown active. "
+                    f"Next Reel allowed in {minutes}m {seconds}s."
+                )
+                return
 
         for item in manifests:
             manifest_message = item["message"]
@@ -1612,7 +1677,8 @@ async def instagram_queue_loop():
     """
     Background loop for the Instagram queue.
 
-    It checks Telegram for pending queue manifests every minute.
+    The worker checks every minute, but the persistent cooldown above
+    allows only ONE successful Reel publication every hour by default.
     """
     await asyncio.sleep(15)
 
@@ -1625,6 +1691,8 @@ async def instagram_queue_loop():
                 f"{type(e).__name__}: {str(e)}"
             )
 
+        # Check frequently so the next Reel is posted close to the
+        # exact one-hour mark without publishing more than one per hour.
         await asyncio.sleep(60)
 
 
@@ -2512,6 +2580,11 @@ def main():
     print(
         f"Bot is running. "
         f"Health server listening on port {PORT}."
+    )
+    print(
+        "Instagram posting interval: "
+        f"{INSTAGRAM_POST_INTERVAL_SECONDS} seconds "
+        "(default 1 hour)."
     )
 
     bot_application.run_polling(
