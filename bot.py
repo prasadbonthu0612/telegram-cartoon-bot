@@ -93,6 +93,14 @@ pending_video_message_id = None
 public_media_files = {}
 public_media_lock = threading.Lock()
 
+# Instagram / Meta transient rate-limit state.
+# When Meta returns a rate-limit response, the queue publisher pauses all
+# Instagram API attempts until this timestamp. The Telegram clips remain
+# safely stored and are retried automatically after the cooldown.
+instagram_rate_limit_until = 0.0
+instagram_rate_limit_reason = None
+instagram_rate_limit_notified_until = 0.0
+
 
 # ============================================================
 # HEALTH SERVER
@@ -418,10 +426,160 @@ async def load_admin_chat_id():
 # INSTAGRAM API
 # ============================================================
 
+class InstagramRateLimitError(RuntimeError):
+    """Raised when Meta tells us the Instagram API is temporarily rate-limited."""
+
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _safe_json_loads(value):
+    if not value:
+        return None
+    try:
+        return json.loads(value)
+    except Exception:
+        return None
+
+
+def _find_regain_time(value):
+    """Recursively find Meta's estimated_time_to_regain_access value."""
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "estimated_time_to_regain_access":
+                try:
+                    return float(child)
+                except (TypeError, ValueError):
+                    pass
+            found = _find_regain_time(child)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _find_regain_time(child)
+            if found is not None:
+                return found
+    return None
+
+
+def _extract_instagram_rate_limit_info(headers, data):
+    """Return (is_rate_limited, retry_seconds, reason)."""
+    error = data.get("error", {}) if isinstance(data, dict) else {}
+    code = error.get("code")
+    subcode = error.get("error_subcode")
+    is_transient = error.get("is_transient") is True
+    message = str(error.get("message", ""))
+    title = str(error.get("error_user_title", ""))
+
+    rate_limit_text = " ".join(
+        value.lower()
+        for value in (message, title)
+        if value
+    )
+
+    # Current Meta error seen by this bot is code 4, subcode 1349210,
+    # with an explicit "Rate Limit Exceeded" message. Keep detection
+    # focused enough to avoid misclassifying unrelated 403 errors.
+    is_rate_limit = (
+        code == 4
+        or subcode == 1349210
+        or "rate limit" in rate_limit_text
+        or "rate-limit" in rate_limit_text
+    )
+
+    # Some Meta throttles expose a Retry-After header.
+    retry_after = None
+    try:
+        header_value = headers.get("Retry-After") if headers else None
+        if header_value:
+            retry_after = max(0.0, float(header_value))
+    except (TypeError, ValueError):
+        pass
+
+    # Meta's business-use-case header can contain an estimated time to
+    # regain access. It is JSON and its exact nesting can vary.
+    usage_header = None
+    if headers:
+        usage_header = (
+            headers.get("X-Business-Use-Case-Usage")
+            or headers.get("x-business-use-case-usage")
+        )
+
+    if usage_header:
+        usage_data = _safe_json_loads(usage_header)
+        estimated = _find_regain_time(usage_data)
+        if estimated is not None:
+            # Meta's value is generally expressed in minutes.
+            estimated_seconds = max(0.0, estimated * 60.0)
+            retry_after = max(retry_after or 0.0, estimated_seconds)
+
+    reason = (
+        f"Meta rate limit detected (HTTP response code={code}, "
+        f"subcode={subcode}, transient={is_transient})."
+    )
+
+    return is_rate_limit, retry_after, reason
+
+
+def _activate_instagram_rate_limit(retry_after=None, reason=None):
+    """Pause Instagram API publishing for a conservative cooldown."""
+    global instagram_rate_limit_until
+    global instagram_rate_limit_reason
+
+    # If Meta supplied a duration, honor it with a small safety margin.
+    # Otherwise use a 15-minute minimum pause. This prevents the queue loop
+    # from repeatedly hitting the same throttled API node every minute.
+    if retry_after is None:
+        cooldown = 15 * 60
+    else:
+        cooldown = max(float(retry_after), 15 * 60)
+        cooldown += 30
+
+    proposed_until = time.time() + cooldown
+    instagram_rate_limit_until = max(
+        instagram_rate_limit_until,
+        proposed_until,
+    )
+    instagram_rate_limit_reason = reason or "Instagram API rate limit."
+
+    remaining = max(0, int(instagram_rate_limit_until - time.time()))
+    print(
+        "⏳ Instagram API rate limit active. "
+        f"Publishing paused for about {remaining // 60}m {remaining % 60:02d}s."
+    )
+
+
+def _raise_instagram_api_error(http_code, data, headers=None):
+    is_rate_limit, retry_after, reason = _extract_instagram_rate_limit_info(
+        headers or {},
+        data,
+    )
+
+    if is_rate_limit:
+        message = (
+            f"Instagram API HTTP {http_code}: "
+            f"{json.dumps(data, ensure_ascii=False)}"
+        )
+        _activate_instagram_rate_limit(retry_after, reason)
+        raise InstagramRateLimitError(
+            message,
+            retry_after=retry_after,
+        )
+
+    raise RuntimeError(
+        f"Instagram API HTTP {http_code}: "
+        f"{json.dumps(data, ensure_ascii=False)}"
+    )
+
+
 def instagram_api_get(path, params=None):
     """
     Make a GET request to the current Instagram API using the
     Instagram Login access token stored in Render environment variables.
+
+    Rate-limit responses are converted into InstagramRateLimitError so the
+    queue can pause instead of retrying the same throttled API every minute.
     """
     if not INSTAGRAM_ACCESS_TOKEN:
         raise RuntimeError("INSTAGRAM_ACCESS_TOKEN is missing.")
@@ -456,9 +614,14 @@ def instagram_api_get(path, params=None):
         except Exception:
             data = {"raw": body}
 
-        raise RuntimeError(
-            f"Instagram API HTTP {e.code}: {json.dumps(data, ensure_ascii=False)}"
+        _raise_instagram_api_error(
+            e.code,
+            data,
+            getattr(e, "headers", None),
         )
+
+    except InstagramRateLimitError:
+        raise
 
     except Exception as e:
         raise RuntimeError(
@@ -470,6 +633,9 @@ def instagram_api_post(path, params=None):
     """
     Make a form-encoded POST request to the Instagram Graph API.
     The access token is stored only in Render environment variables.
+
+    Rate-limit responses are converted into InstagramRateLimitError so the
+    queue can pause instead of retrying the same throttled API every minute.
     """
     if not INSTAGRAM_ACCESS_TOKEN:
         raise RuntimeError("INSTAGRAM_ACCESS_TOKEN is missing.")
@@ -507,10 +673,14 @@ def instagram_api_post(path, params=None):
         except Exception:
             data = {"raw": body_text}
 
-        raise RuntimeError(
-            f"Instagram API HTTP {e.code}: "
-            f"{json.dumps(data, ensure_ascii=False)}"
+        _raise_instagram_api_error(
+            e.code,
+            data,
+            getattr(e, "headers", None),
         )
+
+    except InstagramRateLimitError:
+        raise
 
     except Exception as e:
         raise RuntimeError(
@@ -609,13 +779,20 @@ def publish_reel_from_file(file_path, title, part_index, total_parts):
         )
 
         # Instagram needs time to download/transcode the video.
-        # Poll until the container is ready.
+        # Poll with increasing intervals instead of hitting the API every
+        # five seconds. This is much friendlier to Meta's rate limits while
+        # still checking frequently enough for normal Reel processing.
         max_attempts = 60
-        poll_seconds = 5
+        poll_schedule = [10, 15, 20, 30, 45, 60]
 
         for attempt in range(1, max_attempts + 1):
 
-            time.sleep(poll_seconds)
+            wait_seconds = poll_schedule[min(attempt - 1, len(poll_schedule) - 1)]
+            print(
+                f"⏱️ Waiting {wait_seconds}s before Instagram status check "
+                f"{attempt}/{max_attempts}..."
+            )
+            time.sleep(wait_seconds)
 
             _, status_data = instagram_api_get(
                 creation_id,
@@ -649,9 +826,12 @@ def publish_reel_from_file(file_path, title, part_index, total_parts):
                 )
 
         else:
+            total_wait = sum(poll_schedule[:len(poll_schedule)]) + (
+                max_attempts - len(poll_schedule)
+            ) * poll_schedule[-1]
             raise RuntimeError(
-                "Instagram video processing timed out after "
-                f"{max_attempts * poll_seconds} seconds."
+                "Instagram video processing timed out after approximately "
+                f"{total_wait} seconds."
             )
 
         print(
@@ -1800,6 +1980,24 @@ async def process_pending_queues():
         )
         return
 
+    # Meta can temporarily throttle the API node used by the application.
+    # Once that happens, do not make another Instagram API request every
+    # minute. The queue remains in Telegram and this worker automatically
+    # resumes after the cooldown.
+    global instagram_rate_limit_until
+    global instagram_rate_limit_notified_until
+
+    if time.time() < instagram_rate_limit_until:
+        remaining = max(
+            0,
+            int(instagram_rate_limit_until - time.time())
+        )
+        print(
+            "⏳ Instagram API rate-limit cooldown active. "
+            f"Retrying in about {remaining // 60}m {remaining % 60:02d}s."
+        )
+        return
+
     if not PUBLIC_BASE_URL:
         print(
             "⚠️ PUBLIC_BASE_URL is missing. "
@@ -1940,6 +2138,55 @@ async def process_pending_queues():
 
                 # Publish only one clip per scan. This avoids
                 # hammering the API and makes failures isolated.
+                return
+
+            except InstagramRateLimitError as e:
+                target_clip["status"] = "FAILED"
+                target_clip["instagram_status"] = "FAILED"
+
+                await save_queue_manifest(
+                    manifest_message,
+                    queue
+                )
+
+                remaining = max(
+                    0,
+                    int(instagram_rate_limit_until - time.time())
+                )
+
+                print(
+                    "⏳ Instagram API rate limit reached. "
+                    "The queue is paused safely.\n"
+                    f"Retry window: about {remaining // 60}m "
+                    f"{remaining % 60:02d}s.\n"
+                    f"Details: {str(e)}"
+                )
+
+                # Notify once for the active cooldown instead of sending a
+                # new failure message every minute while Meta is throttling.
+                now_timestamp = time.time()
+                should_notify = (
+                    now_timestamp >= instagram_rate_limit_notified_until
+                )
+
+                if should_notify and admin_chat_id:
+                    instagram_rate_limit_notified_until = instagram_rate_limit_until
+                    await bot_application.bot.send_message(
+                        chat_id=admin_chat_id,
+                        text=(
+                            "⏳ INSTAGRAM API RATE LIMIT\n\n"
+                            f"🎬 {queue.get('title', 'Cartoon')}\n"
+                            f"📌 Part: {clip_index}/{queue.get('total_clips', len(clips))}\n\n"
+                            "Meta has temporarily rate-limited the Instagram API.\n"
+                            f"⏸️ Publishing paused for about {remaining // 60}m "
+                            f"{remaining % 60:02d}s.\n\n"
+                            "⚠️ The Telegram clip was NOT deleted.\n"
+                            "It will remain safely stored and the bot will "
+                            "retry automatically after the cooldown.\n\n"
+                            "📥 Telegram download/split/upload pipeline is unaffected."
+                        )
+                    )
+
                 return
 
             except Exception as e:
