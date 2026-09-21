@@ -25,7 +25,7 @@ from telegram.ext import (
     filters,
 )
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils
 from telethon.errors import MessageNotModifiedError
 from telethon.sessions import StringSession
 
@@ -71,6 +71,10 @@ UPLOAD_REMINDER_INTERVAL_SECONDS = int(
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 STORAGE_CHANNEL_NAME = "Cartoon Clip Storage"
+
+# Telegram transfer tuning. Telethon allows up to 512 KB per file chunk.
+# Larger chunks reduce request overhead for large video transfers.
+TELEGRAM_TRANSFER_PART_SIZE_KB = 512
 
 
 # ============================================================
@@ -1354,6 +1358,27 @@ async def split_video(
 
 
 # ============================================================
+# FAST TELEGRAM DOWNLOAD
+# ============================================================
+
+async def fast_download_telegram_media(message, output_path, progress_callback=None):
+    """Download Telegram media using the maximum 512 KB request size."""
+    dc_id, location = utils.get_input_location(message)
+    file_size = getattr(getattr(message, "file", None), "size", None)
+
+    downloaded = await telethon_client.download_file(
+        location,
+        file=output_path,
+        part_size_kb=TELEGRAM_TRANSFER_PART_SIZE_KB,
+        file_size=file_size,
+        progress_callback=progress_callback,
+        dc_id=dc_id,
+    )
+
+    return downloaded
+
+
+# ============================================================
 # CREATE QUEUE MANIFEST
 # ============================================================
 
@@ -1593,9 +1618,9 @@ async def publish_one_queue_clip(
             f"{clip_index}/{queue.get('total_clips')}..."
         )
 
-        downloaded = await telethon_client.download_media(
+        downloaded = await fast_download_telegram_media(
             message,
-            file=local_path
+            local_path,
         )
 
         if not downloaded:
@@ -1846,7 +1871,7 @@ async def process_pending_queues():
                     for clip in clips
                 )
 
-                if all_published:
+                if all_published and queue.get("processing_complete", False):
                     queue["status"] = "COMPLETED"
 
                 await save_queue_manifest(
@@ -2149,9 +2174,9 @@ async def process_original_video(
                 f"⏳ ETA: ~{format_duration(eta)}"
             )
 
-        downloaded_path = await telethon_client.download_media(
+        downloaded_path = await fast_download_telegram_media(
             original_message,
-            file=original_path,
+            original_path,
             progress_callback=download_progress,
         )
 
@@ -2226,13 +2251,28 @@ async def process_original_video(
                     f"⏳ ETA: ~{format_duration(eta)}"
                 )
 
+            # Upload the bytes first using the maximum supported Telegram
+            # chunk size, then send the uploaded handle. This avoids the
+            # smaller/default upload chunk sizing used by the high-level path.
+            uploaded_file = await telethon_client.upload_file(
+                final_path,
+                part_size_kb=TELEGRAM_TRANSFER_PART_SIZE_KB,
+                file_size=clip_size,
+                progress_callback=upload_progress,
+            )
+
+            # Preserve the .mp4 filename so Telethon sends this as video media.
+            try:
+                uploaded_file.name = os.path.basename(final_path)
+            except Exception:
+                pass
+
             uploaded_message = await telethon_client.send_file(
                 storage_channel,
-                final_path,
+                uploaded_file,
                 caption=caption,
                 force_document=False,
                 supports_streaming=True,
-                progress_callback=upload_progress,
             )
             if isinstance(uploaded_message, list):
                 if not uploaded_message:
